@@ -4,6 +4,7 @@ import (
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
@@ -200,13 +201,22 @@ func FindProviderForModel(providers []ProviderConfig, model string) string {
 
 // TranslateToOpenAIChunk converts a daemon SSEEvent to an OpenAI SSE data line.
 // Returns the SSE data string, or empty string to skip, or "__DONE__" to signal completion.
-func TranslateToOpenAIChunk(ev *SSEEvent, model string, toolIdx *int) string {
+//
+// `clientTools` is the set of tool names the client declared. The daemon runs
+// its OWN built-in tools (web_search, read_file, ...) during a turn and emits
+// tool_start/tool_result for them; forwarding those as client tool_calls would
+// ask the client to execute a tool it never declared. Pass nil to forward all.
+func TranslateToOpenAIChunk(ev *SSEEvent, model string, toolIdx *int, clientTools map[string]bool) string {
 	switch ev.Type {
 	case "text":
 		return fmt.Sprintf(`{"choices":[{"delta":{"content":%s},"index":0}]}`, jsonString(ev.Content))
 	case "reasoning":
 		return fmt.Sprintf(`{"choices":[{"delta":{"reasoning_content":%s},"index":0}]}`, jsonString(ev.Content))
 	case "tool_start":
+		// Only surface calls the client can actually execute.
+		if clientTools != nil && !clientTools[ev.Name] {
+			return ""
+		}
 		*toolIdx++
 		id := ev.ID
 		if id == "" {
@@ -214,10 +224,19 @@ func TranslateToOpenAIChunk(ev *SSEEvent, model string, toolIdx *int) string {
 		}
 		return fmt.Sprintf(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":%s,"type":"function","function":{"name":%s,"arguments":%s}}]},"index":0}]}`,
 			jsonString(id), jsonString(ev.Name), jsonString(ev.Arguments))
+	case "tool_batch":
+		// The batch announces the whole tool set for this assistant turn,
+		// including daemon-internal tools. Individual tool_start events follow
+		// and are filtered above, so nothing to emit here.
+		return ""
 	case "tool_output", "tool_result", "tool_progress":
 		return ""
 	case "tokens":
-		return fmt.Sprintf(`{"choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}`,
+		// The usage chunk has empty `choices`. The closing brace for the
+		// `usage` object was missing here, which produced malformed JSON once
+		// BuildOpenAIFullChunk spliced it in (it strips the leading '{' and
+		// re-wraps), so strict clients failed with "Extra data: line 1 column N".
+		return fmt.Sprintf(`{"choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`,
 			ev.Prompt, ev.Completion, ev.Total)
 	case "warning", "persistence_warning":
 		// Non-fatal advisories: surface as a reasoning-style notice so clients
@@ -236,12 +255,33 @@ func TranslateToOpenAIChunk(ev *SSEEvent, model string, toolIdx *int) string {
 }
 
 // BuildOpenAIFullChunk wraps a delta into a full OpenAI SSE chunk JSON string.
+//
+// `deltaJSON` is a complete JSON object such as
+// `{"choices":[{"delta":{"content":"hi"},"index":0}]}`. Its leading '{' is
+// stripped and the remaining fields are spliced into the chunk envelope, so the
+// envelope must NOT add a trailing '}' of its own — doing so produced malformed
+// JSON on every text and tool_call frame (strict clients abort the stream with
+// "Extra data: line 1 column N").
+//
+// The result is validated before being returned; a malformed frame is dropped
+// and logged rather than emitted.
 func BuildOpenAIFullChunk(deltaJSON string, model string) string {
-	if deltaJSON == "__DONE__" {
+	if deltaJSON == "__DONE__" || deltaJSON == "" {
 		return ""
 	}
-	return fmt.Sprintf(`{"id":"chatcmpl-atomcode","object":"chat.completion.chunk","created":%d,"model":%s,%s}`,
+	if !json.Valid([]byte(deltaJSON)) {
+		log.Printf("atmc: dropping malformed delta (invalid JSON): %s", deltaJSON)
+		return ""
+	}
+	// deltaJSON[1:] drops the leading '{', leaving `"choices":[...]}` which
+	// closes the envelope itself.
+	full := fmt.Sprintf(`{"id":"chatcmpl-atomcode","object":"chat.completion.chunk","created":%d,"model":%s,%s`,
 		time.Now().Unix(), jsonString(model), deltaJSON[1:])
+	if !json.Valid([]byte(full)) {
+		log.Printf("atmc: dropping malformed chunk after splice: %s", full)
+		return ""
+	}
+	return full
 }
 
 // ─── Anthropic SSE Translation ───────────────────────────────────────────────
@@ -261,14 +301,25 @@ func NewAnthropicState() *AnthropicState {
 }
 
 // TranslateToAnthropicSSE converts a daemon SSEEvent to Anthropic SSE data lines.
-func TranslateToAnthropicSSE(ev *SSEEvent, model string, state *AnthropicState) []string {
+//
+// `clientTools` is the set of tool names the client declared; the daemon's own
+// built-in tools (web_search, read_file, ...) are filtered out so the client is
+// never asked to execute a tool it did not declare. Pass nil to forward all.
+func TranslateToAnthropicSSE(ev *SSEEvent, model string, state *AnthropicState, clientTools map[string]bool) []string {
 	switch ev.Type {
 	case "text":
 		return translateAnthropicText(ev, model, state)
 	case "reasoning":
 		return translateAnthropicReasoning(ev, model, state)
 	case "tool_start":
+		if clientTools != nil && !clientTools[ev.Name] {
+			return nil
+		}
 		return translateAnthropicToolStart(ev, model, state)
+	case "tool_batch":
+		// Announces every tool for the turn, including daemon-internal ones.
+		// The individual tool_start events are filtered above.
+		return nil
 	case "tool_output", "tool_result", "tool_progress":
 		return nil
 	case "tokens":

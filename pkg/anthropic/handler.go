@@ -360,7 +360,7 @@ func (h *Handler) handleStreamChat(w http.ResponseWriter, r *http.Request, req *
 				buf := bridgeBuf.String()
 				emit, _ := toolbridge.SplitStreamBuffer(buf)
 				if emit != "" {
-					for _, line := range atmc.TranslateToAnthropicSSE(&atmc.SSEEvent{Type: "text", Content: emit}, req.Model, state) {
+					for _, line := range atmc.TranslateToAnthropicSSE(&atmc.SSEEvent{Type: "text", Content: emit}, req.Model, state, validNames) {
 						send(line)
 					}
 				}
@@ -378,7 +378,7 @@ func (h *Handler) handleStreamChat(w http.ResponseWriter, r *http.Request, req *
 				send(`{"type":"message_stop"}`)
 				hasSentStop = true
 			} else if !hasSentStop {
-				lines := atmc.TranslateToAnthropicSSE(&ev, req.Model, state)
+				lines := atmc.TranslateToAnthropicSSE(&ev, req.Model, state, validNames)
 				for _, line := range lines {
 					send(line)
 				}
@@ -395,7 +395,7 @@ func (h *Handler) handleStreamChat(w http.ResponseWriter, r *http.Request, req *
 			if toolbridge.ContainsCompleteToolCall(buf) {
 				emit, _ := toolbridge.SplitStreamBuffer(buf)
 				if emit != "" {
-					for _, line := range atmc.TranslateToAnthropicSSE(&atmc.SSEEvent{Type: "text", Content: emit}, req.Model, state) {
+					for _, line := range atmc.TranslateToAnthropicSSE(&atmc.SSEEvent{Type: "text", Content: emit}, req.Model, state, validNames) {
 						send(line)
 					}
 				}
@@ -403,7 +403,7 @@ func (h *Handler) handleStreamChat(w http.ResponseWriter, r *http.Request, req *
 				emitToolUse(calls)
 				bridgeBuf.Reset()
 			} else if emit, _ := toolbridge.SplitStreamBuffer(buf); emit != "" {
-				for _, line := range atmc.TranslateToAnthropicSSE(&atmc.SSEEvent{Type: "text", Content: emit}, req.Model, state) {
+				for _, line := range atmc.TranslateToAnthropicSSE(&atmc.SSEEvent{Type: "text", Content: emit}, req.Model, state, validNames) {
 					send(line)
 				}
 				rest := buf[len(emit):]
@@ -424,7 +424,7 @@ func (h *Handler) handleStreamChat(w http.ResponseWriter, r *http.Request, req *
 			continue
 		}
 
-		lines := atmc.TranslateToAnthropicSSE(&ev, req.Model, state)
+		lines := atmc.TranslateToAnthropicSSE(&ev, req.Model, state, validNames)
 		for _, line := range lines {
 			send(line)
 		}

@@ -7,8 +7,13 @@ import (
 	"github.com/vibe-coding-labs/AtomCode2API/pkg/atmc"
 )
 
-// TranslateToOpenAIResponse converts daemon SSE events into a non-streaming ChatCompletionResponse.
-func TranslateToOpenAIResponse(events []atmc.SSEEvent, model string) *ChatCompletionResponse {
+// TranslateToOpenAIResponse converts daemon SSE events into a non-streaming
+// ChatCompletionResponse.
+//
+// `clientTools` is the set of tool names the client declared; tool_start events
+// for the daemon's own built-in tools are ignored so the client is never asked
+// to execute a tool it did not declare. Pass nil to forward all.
+func TranslateToOpenAIResponse(events []atmc.SSEEvent, model string, clientTools map[string]bool) *ChatCompletionResponse {
 	resp := &ChatCompletionResponse{
 		ID:      "chatcmpl-atomcode",
 		Object:  "chat.completion",
@@ -27,6 +32,9 @@ func TranslateToOpenAIResponse(events []atmc.SSEEvent, model string) *ChatComple
 		case "text":
 			resp.Choices[0].Message.Content += ev.Content
 		case "tool_start":
+			if clientTools != nil && !clientTools[ev.Name] {
+				continue
+			}
 			tc := ToolCall{
 				ID:   ev.ID,
 				Type: "function",

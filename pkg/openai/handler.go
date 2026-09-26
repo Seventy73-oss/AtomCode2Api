@@ -268,7 +268,7 @@ func (s *Server) handleNonStreamChat(w http.ResponseWriter, r *http.Request, req
 		s.sessions.Set(convKey, lastSessionID)
 	}
 
-	resp := TranslateToOpenAIResponse(events, req.Model)
+	resp := TranslateToOpenAIResponse(events, req.Model, toolbridge.Names(tools))
 
 	// Convert the text protocol back into real tool_calls.
 	if len(tools) > 0 {
@@ -453,7 +453,7 @@ func (s *Server) handleStreamChat(w http.ResponseWriter, r *http.Request, req *C
 		}
 		if bridging && (ev.Type == "reasoning") {
 			// Reasoning stays visible; it never contains the protocol block.
-			delta := atmc.TranslateToOpenAIChunk(&ev, req.Model, &toolIdx)
+			delta := atmc.TranslateToOpenAIChunk(&ev, req.Model, &toolIdx, validNames)
 			if delta != "" && delta != "__DONE__" {
 				if full := atmc.BuildOpenAIFullChunk(delta, req.Model); full != "" {
 					fmt.Fprintf(w, "data: %s\n\n", full)
@@ -463,7 +463,7 @@ func (s *Server) handleStreamChat(w http.ResponseWriter, r *http.Request, req *C
 			continue
 		}
 
-		delta := atmc.TranslateToOpenAIChunk(&ev, req.Model, &toolIdx)
+		delta := atmc.TranslateToOpenAIChunk(&ev, req.Model, &toolIdx, validNames)
 		if delta == "" {
 			continue
 		}

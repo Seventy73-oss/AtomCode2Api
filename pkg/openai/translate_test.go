@@ -12,7 +12,7 @@ func TestTranslateToOpenAIResponse(t *testing.T) {
 		{Type: "text", Content: " world"},
 		{Type: "tokens", Prompt: 10, Completion: 20, Total: 30},
 	}
-	resp := TranslateToOpenAIResponse(events, "test-model")
+	resp := TranslateToOpenAIResponse(events, "test-model", nil)
 	if resp == nil {
 		t.Fatal("expected non-nil response")
 	}
@@ -42,7 +42,7 @@ func TestTranslateToOpenAIResponseWithToolCalls(t *testing.T) {
 		{Type: "tool_start", ID: "call_1", Name: "read_file", Arguments: `{"path":"a.txt"}`},
 		{Type: "tokens", Prompt: 5, Completion: 10, Total: 15},
 	}
-	resp := TranslateToOpenAIResponse(events, "test-model")
+	resp := TranslateToOpenAIResponse(events, "test-model", nil)
 	if resp.Choices[0].FinishReason == nil || *resp.Choices[0].FinishReason != "tool_calls" {
 		t.Errorf("expected tool_calls finish reason")
 	}
@@ -59,7 +59,7 @@ func TestTranslateToOpenAIResponseWithError(t *testing.T) {
 		{Type: "text", Content: "partial"},
 		{Type: "error", Message: "something went wrong"},
 	}
-	resp := TranslateToOpenAIResponse(events, "m")
+	resp := TranslateToOpenAIResponse(events, "m", nil)
 	if resp.Choices[0].FinishReason == nil || *resp.Choices[0].FinishReason != "error" {
 		t.Errorf("expected error finish reason")
 	}

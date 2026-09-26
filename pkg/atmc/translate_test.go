@@ -1,6 +1,7 @@
 package atmc
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -159,7 +160,7 @@ func TestTranslateToOpenAIChunk(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := TranslateToOpenAIChunk(&c.ev, "test-model", &toolIdx)
+			got := TranslateToOpenAIChunk(&c.ev, "test-model", &toolIdx, nil)
 			if !c.expectFn(got) {
 				t.Errorf("unexpected result: %s", got)
 			}
@@ -171,7 +172,7 @@ func TestTranslateToAnthropicSSE(t *testing.T) {
 	state := NewAnthropicState()
 	// First event should produce message_start + content_block_start + content_block_delta
 	ev := SSEEvent{Type: "text", Content: "hello"}
-	lines := TranslateToAnthropicSSE(&ev, "test-model", state)
+	lines := TranslateToAnthropicSSE(&ev, "test-model", state, nil)
 	if len(lines) != 3 {
 		t.Errorf("expected 3 lines for initial text, got %d", len(lines))
 	}
@@ -189,7 +190,7 @@ func TestTranslateToAnthropicSSE(t *testing.T) {
 	state2 := NewAnthropicState()
 	state2.HasSentStart = true
 	ev2 := SSEEvent{Type: "text", Content: "more"}
-	lines2 := TranslateToAnthropicSSE(&ev2, "test-model", state2)
+	lines2 := TranslateToAnthropicSSE(&ev2, "test-model", state2, nil)
 	if len(lines2) != 1 {
 		t.Errorf("expected 1 line for subsequent text, got %d", len(lines2))
 	}
@@ -214,6 +215,50 @@ func TestBuildOpenAIFullChunk(t *testing.T) {
 	// DONE should return empty
 	if s := BuildOpenAIFullChunk("__DONE__", "m"); s != "" {
 		t.Errorf("expected empty for DONE, got %s", s)
+	}
+}
+
+// Every streamed frame must be valid JSON. The envelope previously appended an
+// extra '}' after splicing the delta, so strict clients aborted the stream with
+// "Extra data: line 1 column N".
+func TestStreamedChunksAreValidJSON(t *testing.T) {
+	idx := 0
+	events := []SSEEvent{
+		{Type: "text", Content: "hello"},
+		{Type: "text", Content: "world"},
+		{Type: "reasoning", Content: "thinking"},
+		{Type: "tool_start", ID: "call_1", Name: "get_weather", Arguments: `{"city":"Beijing"}`},
+		{Type: "tokens", Prompt: 10, Completion: 5, Total: 15},
+		{Type: "warning", Message: "compacted"},
+		{Type: "rate_limited", ResetLabel: "21:00"},
+		{Type: "error", Message: "boom"},
+	}
+
+	for _, ev := range events {
+		e := ev
+		delta := TranslateToOpenAIChunk(&e, "test-model", &idx, nil)
+		if delta == "" || delta == "__DONE__" {
+			continue
+		}
+		if !json.Valid([]byte(delta)) {
+			t.Errorf("event %q produced invalid delta JSON: %s", ev.Type, delta)
+			continue
+		}
+		full := BuildOpenAIFullChunk(delta, "test-model")
+		if full == "" {
+			t.Errorf("event %q produced an empty chunk", ev.Type)
+			continue
+		}
+		if !json.Valid([]byte(full)) {
+			t.Errorf("event %q produced invalid chunk JSON: %s", ev.Type, full)
+		}
+	}
+}
+
+// A malformed delta must be dropped, never emitted.
+func TestBuildOpenAIFullChunkRejectsMalformed(t *testing.T) {
+	if got := BuildOpenAIFullChunk(`{"choices":[`, "m"); got != "" {
+		t.Errorf("expected malformed delta to be dropped, got %s", got)
 	}
 }
 
@@ -276,5 +321,61 @@ func TestFormatMessagesPlainToolMessage(t *testing.T) {
 	got := FormatMessages(msgs, "")
 	if !strings.Contains(got, "TOOL RESULT") || !strings.Contains(got, "file contents") {
 		t.Errorf("unexpected render: %s", got)
+	}
+}
+
+// The daemon runs its own built-in tools (web_search, read_file, ...) during a
+// turn and emits tool_start for them. Those must NOT be surfaced to a client
+// that never declared them, or the client is asked to execute an unknown tool.
+func TestDaemonInternalToolsAreFiltered(t *testing.T) {
+	clientTools := map[string]bool{"get_weather": true}
+
+	idx := 0
+	internal := SSEEvent{Type: "tool_start", ID: "call_1", Name: "web_search",
+		Arguments: `{"query":"tokyo weather"}`}
+	if got := TranslateToOpenAIChunk(&internal, "m", &idx, clientTools); got != "" {
+		t.Errorf("daemon-internal tool must be filtered, got: %s", got)
+	}
+
+	declared := SSEEvent{Type: "tool_start", ID: "call_2", Name: "get_weather",
+		Arguments: `{"city":"Tokyo"}`}
+	if got := TranslateToOpenAIChunk(&declared, "m", &idx, clientTools); got == "" {
+		t.Error("client-declared tool must be forwarded")
+	}
+
+	// tool_batch announces every tool for the turn, including internal ones.
+	batch := SSEEvent{Type: "tool_batch", Calls: []ToolBatchCall{
+		{ID: "call_1", Name: "web_search"},
+		{ID: "call_2", Name: "get_weather"},
+	}}
+	if got := TranslateToOpenAIChunk(&batch, "m", &idx, clientTools); got != "" {
+		t.Errorf("tool_batch must not be forwarded directly, got: %s", got)
+	}
+
+	// nil means "no filtering" for callers that have no tool context.
+	if got := TranslateToOpenAIChunk(&internal, "m", &idx, nil); got == "" {
+		t.Error("nil clientTools should forward everything")
+	}
+}
+
+func TestDaemonInternalToolsFilteredAnthropic(t *testing.T) {
+	clientTools := map[string]bool{"get_weather": true}
+	state := NewAnthropicState()
+
+	internal := SSEEvent{Type: "tool_start", ID: "call_1", Name: "read_file",
+		Arguments: `{"file_path":"/etc/hosts"}`}
+	if lines := TranslateToAnthropicSSE(&internal, "m", state, clientTools); len(lines) != 0 {
+		t.Errorf("daemon-internal tool must be filtered, got: %v", lines)
+	}
+
+	declared := SSEEvent{Type: "tool_start", ID: "call_2", Name: "get_weather",
+		Arguments: `{"city":"Tokyo"}`}
+	if lines := TranslateToAnthropicSSE(&declared, "m", state, clientTools); len(lines) == 0 {
+		t.Error("client-declared tool must be forwarded")
+	}
+
+	batch := SSEEvent{Type: "tool_batch", Calls: []ToolBatchCall{{Name: "web_search"}}}
+	if lines := TranslateToAnthropicSSE(&batch, "m", state, clientTools); len(lines) != 0 {
+		t.Errorf("tool_batch must not be forwarded, got: %v", lines)
 	}
 }
