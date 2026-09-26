@@ -198,6 +198,44 @@ func FindProviderForModel(providers []ProviderConfig, model string) string {
 	return ""
 }
 
+// failureStopReasons are the daemon's terminal `stop_reason` values that mean
+// the turn failed. The daemon reports these on the `done` event (mirroring
+// atomcode_kernel::event::StopReason) and does NOT emit an `error` event, so
+// without this check a failed turn looks like a successful empty response.
+var failureStopReasons = map[string]bool{
+	"provider_error":  true,
+	"internal_error":  true,
+	"timeout":         true,
+	"prompt_rejected": true,
+	"policy_denied":   true,
+	"rate_limited":    true,
+}
+
+// IsFailureStopReason reports whether a terminal stop_reason means the turn
+// failed and the client must be told.
+//
+// Loop-limit reasons (max_rounds, repeat_loop, tool_loop_detected,
+// max_continuations) are NOT failures: the agent produced output and merely hit
+// a limit. "stopped" / "cancelled" mean the user interrupted, which is also a
+// normal terminal state.
+func IsFailureStopReason(reason string) bool {
+	return failureStopReasons[reason]
+}
+
+// StopReasonHTTPStatus maps a failure stop_reason onto an HTTP status.
+func StopReasonHTTPStatus(reason string) int {
+	switch reason {
+	case "rate_limited":
+		return 429
+	case "prompt_rejected", "policy_denied":
+		return 400
+	case "timeout":
+		return 504
+	default: // provider_error, internal_error
+		return 502
+	}
+}
+
 // ModelNames returns the selectable model ids for an error message.
 func ModelNames(providers []ProviderConfig) []string {
 	names := make([]string, 0, len(providers))
@@ -267,9 +305,13 @@ func TranslateToOpenAIChunk(ev *SSEEvent, model string, toolIdx *int, clientTool
 		return fmt.Sprintf(`{"choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`,
 			ev.Prompt, ev.Completion, ev.Total)
 	case "warning", "persistence_warning":
-		// Non-fatal advisories: surface as a reasoning-style notice so clients
-		// see something instead of silently dropping the signal.
-		return fmt.Sprintf(`{"choices":[{"delta":{"reasoning_content":%s},"index":0}]}`, jsonString(ev.Message))
+		// Advisory diagnostics only. These are logged rather than injected into
+		// the response: for a fatal upstream error the daemon emits both this
+		// warning AND done.stop_reason=provider_error, and surfacing the text as
+		// reasoning_content produced a 200 with an empty answer that looked like
+		// success. Terminal failures are reported via stop_reason instead.
+		log.Printf("atmc: daemon %s: %s", ev.Type, ev.Message)
+		return ""
 	case "rate_limited":
 		return fmt.Sprintf(`{"choices":[{"delta":{"reasoning_content":%s},"index":0}]}`,
 			jsonString(fmt.Sprintf("[rate limited] reset %s", strOr(ev.ResetLabel, ev.ResetAtDisplay))))
@@ -356,10 +398,8 @@ func TranslateToAnthropicSSE(ev *SSEEvent, model string, state *AnthropicState, 
 				ev.Completion, ev.Prompt, jsonString(state.MessageID)),
 		}
 	case "warning", "persistence_warning":
-		return []string{
-			fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`,
-				state.ContentIndex, jsonString("\n[notice] "+ev.Message+"\n")),
-		}
+		log.Printf("atmc: daemon %s: %s", ev.Type, ev.Message)
+		return nil
 	case "rate_limited":
 		label := strOr(ev.ResetLabel, ev.ResetAtDisplay)
 		return []string{

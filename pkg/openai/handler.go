@@ -261,6 +261,7 @@ func (s *Server) handleNonStreamChat(w http.ResponseWriter, r *http.Request, req
 
 	var events []atmc.SSEEvent
 	var lastSessionID string
+	var stopReason, stopMessage string
 	ch, err := s.Client.ChatStream(daemonReq)
 	if err != nil {
 		writeError(w, 502, fmt.Sprintf("daemon chat error: %v", err))
@@ -270,6 +271,8 @@ func (s *Server) handleNonStreamChat(w http.ResponseWriter, r *http.Request, req
 	for ev := range ch {
 		if ev.Type == "done" {
 			lastSessionID = ev.SessionID
+			stopReason = ev.StopReason
+			stopMessage = ev.Message
 			break
 		}
 		events = append(events, ev)
@@ -278,6 +281,15 @@ func (s *Server) handleNonStreamChat(w http.ResponseWriter, r *http.Request, req
 	// Persist session for multi-turn context
 	if lastSessionID != "" && lastSessionID != sessionID {
 		s.sessions.Set(convKey, lastSessionID)
+	}
+
+	// The daemon signals a failed turn through done.stop_reason rather than an
+	// `error` event. Without this check the client received HTTP 200 with empty
+	// content and finish_reason "stop", i.e. a silent failure.
+	if atmc.IsFailureStopReason(stopReason) {
+		writeError(w, atmc.StopReasonHTTPStatus(stopReason), fmt.Sprintf(
+			"daemon turn failed (%s): %s", stopReason, strOr(stopMessage, "no detail")))
+		return
 	}
 
 	resp := TranslateToOpenAIResponse(events, req.Model, toolbridge.Names(tools))
@@ -414,6 +426,25 @@ func (s *Server) handleStreamChat(w http.ResponseWriter, r *http.Request, req *C
 	for ev := range ch {
 		if ev.Type == "done" {
 			lastSessionID = ev.SessionID
+
+			// A failed turn arrives as done.stop_reason, not an `error` event.
+			// Report it as an SSE error frame with finish_reason "error" instead
+			// of a misleading empty success.
+			if atmc.IsFailureStopReason(ev.StopReason) {
+				msg := fmt.Sprintf("daemon turn failed (%s): %s", ev.StopReason, strOr(ev.Message, "no detail"))
+				log.Printf("openai stream: %s", msg)
+				fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"error":{"message":%s,"type":"upstream_error","code":%d}}`,
+					jsonString(msg), atmc.StopReasonHTTPStatus(ev.StopReason)))
+				flusher.Flush()
+				fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(
+					`{"id":"chatcmpl-atomcode","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"delta":{},"finish_reason":"error","index":0}]}`,
+					time.Now().Unix(), req.Model))
+				flusher.Flush()
+				fmt.Fprint(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				break
+			}
+
 			if bridging {
 				// Final flush: whatever is buffered is the model's last word.
 				if flushBridge(true) {

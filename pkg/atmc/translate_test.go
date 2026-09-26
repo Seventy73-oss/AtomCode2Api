@@ -406,3 +406,67 @@ func TestModelNames(t *testing.T) {
 		t.Errorf("expected sorted non-empty names [a b], got %v", got)
 	}
 }
+
+// The daemon reports a failed turn via done.stop_reason, NOT an `error` event.
+// Treating those as success produced HTTP 200 with empty content, so a 403 from
+// upstream looked like a successful empty answer.
+func TestFailureStopReasons(t *testing.T) {
+	failures := []string{
+		"provider_error", "internal_error", "timeout",
+		"prompt_rejected", "policy_denied", "rate_limited",
+	}
+	for _, r := range failures {
+		if !IsFailureStopReason(r) {
+			t.Errorf("%q should be treated as a failure", r)
+		}
+	}
+
+	// Loop limits and user interruption are normal terminals, not failures:
+	// the agent produced output and merely hit a bound.
+	nonFailures := []string{
+		"", "stopped", "cancelled", "max_rounds",
+		"repeat_loop", "tool_loop_detected", "max_continuations",
+	}
+	for _, r := range nonFailures {
+		if IsFailureStopReason(r) {
+			t.Errorf("%q must not be treated as a failure", r)
+		}
+	}
+}
+
+func TestStopReasonHTTPStatus(t *testing.T) {
+	cases := map[string]int{
+		"provider_error":  502,
+		"internal_error":  502,
+		"timeout":         504,
+		"prompt_rejected": 400,
+		"policy_denied":   400,
+		"rate_limited":    429,
+	}
+	for reason, want := range cases {
+		if got := StopReasonHTTPStatus(reason); got != want {
+			t.Errorf("%s: expected %d, got %d", reason, want, got)
+		}
+	}
+}
+
+// Advisory warnings must not be injected into the response body: the daemon
+// sends the same text as a warning AND as done.message for fatal errors, and
+// surfacing it as reasoning_content corrupted the stream.
+func TestWarningsNotInjectedIntoContent(t *testing.T) {
+	idx := 0
+	ev := SSEEvent{Type: "warning", Message: "HTTP 403: model is not enabled"}
+	if got := TranslateToOpenAIChunk(&ev, "m", &idx, nil); got != "" {
+		t.Errorf("warning must not be emitted as content, got: %s", got)
+	}
+
+	state := NewAnthropicState()
+	if lines := TranslateToAnthropicSSE(&ev, "m", state, nil); len(lines) != 0 {
+		t.Errorf("warning must not be emitted as content, got: %v", lines)
+	}
+
+	persist := SSEEvent{Type: "persistence_warning", Message: "db write failed"}
+	if got := TranslateToOpenAIChunk(&persist, "m", &idx, nil); got != "" {
+		t.Errorf("persistence_warning must not be emitted as content, got: %s", got)
+	}
+}

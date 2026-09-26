@@ -199,6 +199,7 @@ func (h *Handler) handleNonStreamChat(w http.ResponseWriter, r *http.Request, re
 
 	var events []atmc.SSEEvent
 	var lastSessionID string
+	var stopReason, stopMessage string
 	ch, err := h.Client.ChatStream(daemonReq)
 	if err != nil {
 		writeError(w, 502, fmt.Sprintf("daemon error: %v", err))
@@ -207,6 +208,8 @@ func (h *Handler) handleNonStreamChat(w http.ResponseWriter, r *http.Request, re
 	for ev := range ch {
 		if ev.Type == "done" {
 			lastSessionID = ev.SessionID
+			stopReason = ev.StopReason
+			stopMessage = ev.Message
 			break
 		}
 		events = append(events, ev)
@@ -214,6 +217,14 @@ func (h *Handler) handleNonStreamChat(w http.ResponseWriter, r *http.Request, re
 
 	if lastSessionID != "" && lastSessionID != sessionID {
 		h.sessions.set(convKey, lastSessionID)
+	}
+
+	// A failed turn arrives as done.stop_reason, not an `error` event; without
+	// this the client saw a 200 with an empty answer.
+	if atmc.IsFailureStopReason(stopReason) {
+		writeError(w, atmc.StopReasonHTTPStatus(stopReason), fmt.Sprintf(
+			"daemon turn failed (%s): %s", stopReason, strOr(stopMessage, "no detail")))
+		return
 	}
 
 	resp := translateToAnthropicResponse(events, req.Model)
@@ -367,6 +378,25 @@ func (h *Handler) handleStreamChat(w http.ResponseWriter, r *http.Request, req *
 	for ev := range ch {
 		if ev.Type == "done" {
 			lastSessionID = ev.SessionID
+
+			// A failed turn arrives as done.stop_reason, not an `error` event.
+			// Emit an Anthropic error event with stop_reason "error" rather than
+			// a misleading empty end_turn.
+			if atmc.IsFailureStopReason(ev.StopReason) {
+				msg := fmt.Sprintf("daemon turn failed (%s): %s", ev.StopReason, strOr(ev.Message, "no detail"))
+				log.Printf("anthropic stream: %s", msg)
+				if state.CurrentBlock != "" {
+					send(fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, state.ContentIndex))
+					state.CurrentBlock = ""
+				}
+				send(fmt.Sprintf(`{"type":"error","error":{"type":"upstream_error","message":%s}}`, jsonStr(msg)))
+				send(`{"type":"message_delta","delta":{"stop_reason":"error","stop_sequence":null},"usage":{}}`)
+				send(`{"type":"message_stop"}`)
+				hasSentStop = true
+				flusher.Flush()
+				break
+			}
+
 			if bridging && bridgeBuf.Len() > 0 {
 				buf := bridgeBuf.String()
 				emit, _ := toolbridge.SplitStreamBuffer(buf)
