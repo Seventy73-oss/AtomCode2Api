@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 )
@@ -193,6 +194,33 @@ func FindProviderForModel(providers []ProviderConfig, model string) string {
 		if strings.ToLower(p.Model) == modelLower {
 			return p.Name
 		}
+	}
+	return ""
+}
+
+// ModelNames returns the selectable model ids for an error message.
+func ModelNames(providers []ProviderConfig) []string {
+	names := make([]string, 0, len(providers))
+	for _, p := range providers {
+		if p.Name != "" {
+			names = append(names, p.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// DefaultModel returns the daemon's default provider name, or the first
+// available model. Used instead of hardcoding a model name, which goes stale as
+// soon as the CodingPlan catalogue changes.
+func DefaultModel(providers []ProviderConfig) string {
+	for _, p := range providers {
+		if p.IsDefault && p.Name != "" {
+			return p.Name
+		}
+	}
+	if len(providers) > 0 {
+		return providers[0].Name
 	}
 	return ""
 }

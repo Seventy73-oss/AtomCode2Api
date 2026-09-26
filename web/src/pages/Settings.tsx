@@ -22,6 +22,8 @@ interface FieldConfig {
   suffix?: string;
   readOnly?: boolean;
   tag?: string;
+  // When true, select options are loaded from /api/models at runtime.
+  dynamicModels?: boolean;
 }
 
 const FIELD_GROUPS = [
@@ -32,14 +34,12 @@ const FIELD_GROUPS = [
         key: 'default_model',
         label: '默认模型',
         tag: '已生效',
-        tooltip: '当客户端未指定模型，且账号未配置默认模型时使用的模型',
-        placeholder: 'deepseek-v4-flash',
+        tooltip: '当客户端未指定模型，且账号未配置默认模型时使用的模型。选项来自 daemon 实际可用的模型。',
+        placeholder: '从 daemon 读取…',
         type: 'select' as const,
-        options: [
-          { label: 'deepseek-v4-flash（推荐）', value: 'deepseek-v4-flash' },
-          { label: 'deepseek-chat', value: 'deepseek-chat' },
-          { label: 'Qwen-QwQ-32B', value: 'Qwen-QwQ-32B' },
-        ],
+        // Options come from /api/models at runtime; a hardcoded list goes stale
+        // (deepseek-v4-flash no longer exists upstream).
+        dynamicModels: true,
       },
       {
         key: 'default_max_tokens',
@@ -109,8 +109,18 @@ const SettingsPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [changePwLoading, setChangePwLoading] = useState(false);
+  const [modelOptions, setModelOptions] = useState<{ label: string; value: string }[]>([]);
   const [form] = Form.useForm();
   const [pwForm] = Form.useForm();
+
+  const loadModels = async () => {
+    try {
+      const models = await api.listModels();
+      setModelOptions(models.map((m) => ({ label: m.id, value: m.id })));
+    } catch {
+      setModelOptions([]);
+    }
+  };
 
   const fetchSettings = async () => {
     setLoading(true);
@@ -134,7 +144,7 @@ const SettingsPage: React.FC = () => {
     }
   };
 
-  useEffect(() => { fetchSettings(); }, [form]);
+  useEffect(() => { fetchSettings(); loadModels(); }, [form]);
 
   const handleSave = async (values: Settings) => {
     setSaving(true);
@@ -205,7 +215,7 @@ const SettingsPage: React.FC = () => {
       case 'select':
         return (
           <Form.Item key={field.key} name={field.key} label={label}>
-            <Select placeholder={field.placeholder} options={field.options} allowClear disabled={field.readOnly} />
+            <Select placeholder={field.placeholder} options={field.dynamicModels ? modelOptions : field.options} allowClear disabled={field.readOnly} />
           </Form.Item>
         );
       case 'switch':

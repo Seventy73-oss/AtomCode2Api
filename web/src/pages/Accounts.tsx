@@ -15,11 +15,13 @@ import { useNavigate } from 'react-router-dom';
 import { api, accountDisplayName } from '../api';
 import type { Account } from '../api';
 
-const BUILTIN_MODELS = [
-  { label: 'deepseek-v4-flash（推荐）', value: 'deepseek-v4-flash' },
-  { label: 'deepseek-chat', value: 'deepseek-chat' },
-  { label: 'Qwen-QwQ-32B', value: 'Qwen-QwQ-32B' },
-];
+// Model names come from the daemon (see /api/models). Hardcoding them goes
+// stale: deepseek-v4-flash no longer exists in the CodingPlan catalogue, and the
+// daemon silently falls back to its default model for unknown names.
+interface ModelOption {
+  label: string;
+  value: string;
+}
 
 const maskUserId = (id: string): string => {
   if (!id) return '-';
@@ -47,6 +49,16 @@ const Accounts: React.FC = () => {
   const [renameForm] = Form.useForm();
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const [importing, setImporting] = useState(false);
+  const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
+
+  const loadModels = async () => {
+    try {
+      const models = await api.listModels();
+      setModelOptions(models.map((m) => ({ label: m.id, value: m.id })));
+    } catch {
+      setModelOptions([]);
+    }
+  };
 
   const fetchAccounts = async () => {
     setLoading(true);
@@ -60,7 +72,7 @@ const Accounts: React.FC = () => {
     }
   };
 
-  useEffect(() => { fetchAccounts(); }, []);
+  useEffect(() => { fetchAccounts(); loadModels(); }, []);
 
   const handleAdd = async (values: { pt_key: string; user_id: string; is_default?: boolean; default_model?: string }) => {
     try {
@@ -421,7 +433,7 @@ const Accounts: React.FC = () => {
             <Input placeholder="例如：user-12345" />
           </Form.Item>
           <Form.Item name="default_model" label="默认模型">
-            <Select placeholder="留空使用系统默认模型" options={BUILTIN_MODELS} allowClear />
+            <Select placeholder="留空使用系统默认模型" options={modelOptions} allowClear />
           </Form.Item>
           <Form.Item name="is_default" valuePropName="checked" label={<Space size={4}>设为默认账号<Tooltip title="当客户端未提供路由密钥时，请求将自动路由到此默认账号"><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></Space>}>
             <Switch />

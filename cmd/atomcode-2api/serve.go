@@ -79,7 +79,7 @@ func runServe() error {
 
 	// Auto-import daemon credentials into local store on first run
 	if s != nil {
-		autoImportDaemon(s)
+		autoImportDaemon(s, client)
 	}
 
 	// Apply settings from store to active components
@@ -328,7 +328,7 @@ func getEnvDefault(key, def string) string {
 // autoImportDaemon reads the AtomCode daemon's local auth credentials and
 // imports them into the proxy's SQLite store if no accounts exist yet.
 // Also fixes the "local" account if it exists with the wrong pt_key.
-func autoImportDaemon(s *store.Store) {
+func autoImportDaemon(s *store.Store, client *atmc.Client) {
 	accounts, err := s.ListAccounts()
 	if err != nil {
 		log.Printf("auto-import: list accounts failed: %v", err)
@@ -369,11 +369,23 @@ func autoImportDaemon(s *store.Store) {
 		}
 	}
 
-	if err := s.AddAccount(creds.UserID, creds.Token, nickname, true, "deepseek-v4-flash"); err != nil {
+	// Pick the daemon's actual default model rather than a hardcoded name. The
+	// CodingPlan catalogue changes over time (deepseek-v4-flash no longer
+	// exists), and a stale name silently resolves to whatever the daemon
+	// defaults to.
+	defaultModel := ""
+	if providers, err := client.ListProviders(); err == nil {
+		defaultModel = atmc.DefaultModel(providers)
+	}
+	if defaultModel == "" {
+		defaultModel = "AtomGit-qwen3.8-27b"
+	}
+
+	if err := s.AddAccount(creds.UserID, creds.Token, nickname, true, defaultModel); err != nil {
 		log.Printf("auto-import: save account failed: %v", err)
 		return
 	}
 	// Mark credentials as valid immediately since daemon is logged in with a CodingPlan
 	s.SetCredentialValid(creds.UserID, true)
-	log.Printf("auto-import: daemon account %s imported to SQLite store", nickname)
+	log.Printf("auto-import: daemon account %s imported to SQLite store (model=%s)", nickname, defaultModel)
 }

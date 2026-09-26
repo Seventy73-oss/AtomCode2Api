@@ -171,6 +171,21 @@ func (h *Handler) issueJWT() (string, error) {
 	return auth.NewJWTManager(secret).GenerateToken("root", "admin")
 }
 
+// resolveDefaultModel returns the daemon's current default model name, falling
+// back to the first available one. Replaces hardcoded names such as
+// "deepseek-v4-flash", which no longer exist in the CodingPlan catalogue and
+// would silently resolve to whatever the daemon defaults to.
+func (h *Handler) resolveDefaultModel() string {
+	if h.daemon != nil {
+		if providers, err := h.daemon.ListProviders(); err == nil {
+			if m := atmc.DefaultModel(providers); m != "" {
+				return m
+			}
+		}
+	}
+	return "AtomGit-qwen3.8-27b"
+}
+
 func generateRandomHex(n int) string {
 	b := make([]byte, n)
 	io.ReadFull(rand.Reader, b)
@@ -277,14 +292,32 @@ func (h *Handler) handleAccountAction(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 200, map[string]any{"api_key": userID, "valid": valid})
 	case action == "models" && r.Method == http.MethodGet:
-		// Return catalog models filtered to those available for this account
-		writeJSON(w, 200, map[string]any{"models": []map[string]string{
-			{"id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash", "free": "true", "input_price": "¥0", "output_price": "¥0"},
-			{"id": "Qwen/Qwen3-VL-8B-Instruct", "name": "Qwen3-VL 8B Instruct", "free": "true", "input_price": "¥0", "output_price": "¥0"},
-			{"id": "deepseek-chat", "name": "DeepSeek Chat", "free": "false", "input_price": "¥0.5/百万tokens", "output_price": "¥2/百万tokens"},
-			{"id": "deepseek-reasoner", "name": "DeepSeek Reasoner", "free": "false", "input_price": "¥1/百万tokens", "output_price": "¥4/百万tokens"},
-			{"id": "glm-5.2", "name": "GLM 5.2", "free": "false", "input_price": "¥0.5/百万tokens", "output_price": "¥2/百万tokens"},
-		}})
+		// Serve the models the daemon actually exposes. The previous hardcoded
+		// list (deepseek-v4-flash, deepseek-chat, glm-5.2, ...) no longer exists
+		// upstream and misled clients into requesting models that would silently
+		// resolve to the daemon's default.
+		if h.daemon == nil {
+			writeError(w, 503, "daemon client not available")
+			return
+		}
+		providers, err := h.daemon.ListProviders()
+		if err != nil {
+			writeError(w, 502, "无法读取模型列表: "+err.Error())
+			return
+		}
+		models := make([]map[string]any, 0, len(providers))
+		for _, p := range providers {
+			models = append(models, map[string]any{
+				"id":              p.Name,
+				"name":            p.Name,
+				"model":           p.Model,
+				"is_default":      p.IsDefault,
+				"context_window":  p.ContextWindow,
+				"supports_vision": p.SupportsVision,
+				"free":            "true",
+			})
+		}
+		writeJSON(w, 200, map[string]any{"models": models})
 	default:
 		writeError(w, 405, "method not allowed")
 	}
@@ -331,7 +364,7 @@ func (h *Handler) handleAutoLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.store.AddAccount(creds.UserID, creds.Token, creds.UserID, isDefault, "deepseek-v4-flash"); err != nil {
+	if err := h.store.AddAccount(creds.UserID, creds.Token, creds.UserID, isDefault, h.resolveDefaultModel()); err != nil {
 		writeError(w, 500, "保存账号失败: "+err.Error()); return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "user_id": creds.UserID, "is_default": isDefault})
@@ -509,12 +542,19 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
 	if r.Method != http.MethodGet { writeError(w, 405, "method not allowed"); return }
 
-	models := []map[string]string{
-		{"id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash"},
-		{"id": "deepseek-chat", "name": "DeepSeek Chat"},
-		{"id": "Qwen-QwQ-32B", "name": "Qwen QwQ 32B"},
+	// Report the daemon's real models. The previous hardcoded list named models
+	// that no longer exist upstream (deepseek-v4-flash, Qwen-QwQ-32B).
+	if h.daemon != nil {
+		if providers, err := h.daemon.ListProviders(); err == nil {
+			models := make([]map[string]string, 0, len(providers))
+			for _, p := range providers {
+				models = append(models, map[string]string{"id": p.Name, "name": p.Name})
+			}
+			writeJSON(w, 200, map[string]any{"models": models})
+			return
+		}
 	}
-	writeJSON(w, 200, map[string]any{"models": models})
+	writeJSON(w, 200, map[string]any{"models": []map[string]string{}})
 }
 
 // ModelCatalogItem describes a model available through the CodingPlan proxy.
@@ -623,8 +663,14 @@ func (h *Handler) handleCodingPlanStatus(w http.ResponseWriter, r *http.Request)
 
 	// Model catalogue split by CodingPlan tier. Free models are covered by
 	// CodingPlan Lite; the rest need Pro.
-	freeModels := []string{"deepseek-v4-flash", "Qwen/Qwen3-VL-8B-Instruct"}
-	paidModels := []string{"deepseek-chat", "deepseek-reasoner", "glm-5.2"}
+	// Model lists come from the daemon; the old hardcoded names are gone
+	// upstream.
+	var freeModels, paidModels []string
+	if providers, err := h.daemon.ListProviders(); err == nil {
+		for _, p := range providers {
+			freeModels = append(freeModels, p.Name)
+		}
+	}
 
 	// v5.1.0: read structured entitlement + quota from
 	// GET /codingplan/usage/summary. That endpoint is side-effect free, unlike
@@ -871,7 +917,7 @@ func (h *Handler) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		// Use auto-import to load it.
 		creds, err := auth.LoadFromSystem()
 		if err == nil && creds.UserID != "" && creds.Token != "" {
-			h.store.AddAccount(creds.UserID, creds.Token, nickname, isDefault, "deepseek-v4-flash")
+			h.store.AddAccount(creds.UserID, creds.Token, nickname, isDefault, h.resolveDefaultModel())
 			h.store.SetCredentialValid(creds.UserID, true)
 			writeJSON(w, 200, map[string]any{"status": "confirmed", "ok": true, "user_id": creds.UserID, "nickname": nickname})
 			return
@@ -931,7 +977,7 @@ func (h *Handler) handleQRLoginStatus(w http.ResponseWriter, r *http.Request) {
 	accounts, _ := h.store.ListAccounts()
 	for _, a := range accounts { if a.IsDefault { isDefault = false; break } }
 
-	if err := h.store.AddAccount(result.UserID, result.PtKey, nickname, isDefault, "deepseek-v4-flash"); err != nil {
+	if err := h.store.AddAccount(result.UserID, result.PtKey, nickname, isDefault, h.resolveDefaultModel()); err != nil {
 		writeJSON(w, 200, map[string]any{"status": "confirmed", "ok": false, "message": err.Error()})
 		return
 	}

@@ -94,12 +94,23 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve provider from model
+	// Resolve provider from model.
+	//
+	// Reject unknown models: the daemon silently falls back to its default model
+	// when no provider is supplied, so a typo would otherwise appear to work
+	// while running a different model entirely.
 	provider := ""
 	if req.Model != "" {
 		providers, err := h.Client.ListProviders()
-		if err == nil {
+		if err == nil && len(providers) > 0 {
 			provider = atmc.FindProviderForModel(providers, req.Model)
+			if provider == "" {
+				writeError(w, 404, fmt.Sprintf(
+					"model %q not found. Available: %s (the daemon would silently "+
+						"fall back to its default model, so this request was rejected)",
+					req.Model, strings.Join(atmc.ModelNames(providers), ", ")))
+				return
+			}
 		}
 	}
 

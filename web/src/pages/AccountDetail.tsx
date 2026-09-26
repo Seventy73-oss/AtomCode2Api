@@ -223,12 +223,12 @@ const AccountDetail: React.FC = () => {
                 <CodeBlock code={[
                   `ANTHROPIC_BASE_URL=http://192.168.1.90:45678 \\`,
                   `ANTHROPIC_API_KEY=${account.api_token} \\`,
-                  `ANTHROPIC_MODEL=${account.default_model || 'deepseek-v4-flash'} \\`,
+                  `ANTHROPIC_MODEL=${account.default_model || '<模型名>'} \\`,
                   `CLAUDE_CODE_MAX_OUTPUT_TOKENS=65536 \\`,
                   `API_TIMEOUT_MS=6000000 \\`,
                   `CLAUDE_CODE_MAX_RETRIES=1000000 \\`,
                   `claude --dangerously-skip-permissions`,
-                ].join('\n')} onCopy={() => copy(`ANTHROPIC_BASE_URL=http://192.168.1.90:45678\nANTHROPIC_API_KEY=${account.api_token}\nANTHROPIC_MODEL=${account.default_model || 'deepseek-v4-flash'}\nCLAUDE_CODE_MAX_OUTPUT_TOKENS=65536\nAPI_TIMEOUT_MS=6000000\nCLAUDE_CODE_MAX_RETRIES=1000000\nclaude --dangerously-skip-permissions`, 'Claude Code 命令已复制')} />
+                ].join('\n')} onCopy={() => copy(`ANTHROPIC_BASE_URL=http://192.168.1.90:45678\nANTHROPIC_API_KEY=${account.api_token}\nANTHROPIC_MODEL=${account.default_model || '<模型名>'}\nCLAUDE_CODE_MAX_OUTPUT_TOKENS=65536\nAPI_TIMEOUT_MS=6000000\nCLAUDE_CODE_MAX_RETRIES=1000000\nclaude --dangerously-skip-permissions`, 'Claude Code 命令已复制')} />
               </Card>
             </Col>
             <Col xs={24} lg={12}>
@@ -237,11 +237,11 @@ const AccountDetail: React.FC = () => {
                 <CodeBlock code={[
                   `OPENAI_BASE_URL=http://192.168.1.90:45678/v1 \\`,
                   `OPENAI_API_KEY=${account.api_token} \\`,
-                  `OPENAI_MODEL=${account.default_model || 'deepseek-v4-flash'} \\`,
+                  `OPENAI_MODEL=${account.default_model || '<模型名>'} \\`,
                   `NODE_TLS_REJECT_UNAUTHORIZED=0 \\`,
                   `API_TIMEOUT_MS=6000000 \\`,
                   `codex exec "你的问题"`,
-                ].join('\n')} onCopy={() => copy(`OPENAI_BASE_URL=http://192.168.1.90:45678/v1\nOPENAI_API_KEY=${account.api_token}\nOPENAI_MODEL=${account.default_model || 'deepseek-v4-flash'}\nNODE_TLS_REJECT_UNAUTHORIZED=0\nAPI_TIMEOUT_MS=6000000\ncodex exec "你的问题"`, 'Codex 命令已复制')} />
+                ].join('\n')} onCopy={() => copy(`OPENAI_BASE_URL=http://192.168.1.90:45678/v1\nOPENAI_API_KEY=${account.api_token}\nOPENAI_MODEL=${account.default_model || '<模型名>'}\nNODE_TLS_REJECT_UNAUTHORIZED=0\nAPI_TIMEOUT_MS=6000000\ncodex exec "你的问题"`, 'Codex 命令已复制')} />
               </Card>
             </Col>
           </Row>

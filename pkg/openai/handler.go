@@ -164,12 +164,24 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve provider from model name
+	// Resolve provider from model name.
+	//
+	// An unknown model must be rejected rather than passed through: the daemon
+	// silently falls back to its default model when it receives no provider, so
+	// a typo (or a stale hardcoded name) would otherwise "succeed" while quietly
+	// running a completely different model.
 	provider := ""
 	if req.Model != "" {
 		providers, err := s.Client.ListProviders()
-		if err == nil {
+		if err == nil && len(providers) > 0 {
 			provider = atmc.FindProviderForModel(providers, req.Model)
+			if provider == "" {
+				writeError(w, 404, fmt.Sprintf(
+					"model %q not found. Available: %s (the daemon would silently "+
+						"fall back to its default model, so this request was rejected)",
+					req.Model, strings.Join(atmc.ModelNames(providers), ", ")))
+				return
+			}
 		}
 	}
 

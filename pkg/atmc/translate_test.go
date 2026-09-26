@@ -379,3 +379,30 @@ func TestDaemonInternalToolsFilteredAnthropic(t *testing.T) {
 		t.Errorf("tool_batch must not be forwarded, got: %v", lines)
 	}
 }
+
+// The CodingPlan catalogue changes over time, so the default model must be read
+// from the daemon rather than hardcoded (deepseek-v4-flash no longer exists).
+func TestDefaultModel(t *testing.T) {
+	providers := []ProviderConfig{
+		{Name: "AtomGit-glm5.3-flash"},
+		{Name: "AtomGit-qwen3.8-27b", IsDefault: true},
+	}
+	if got := DefaultModel(providers); got != "AtomGit-qwen3.8-27b" {
+		t.Errorf("expected the is_default entry, got %q", got)
+	}
+	// With no default flag, fall back to the first entry rather than a literal.
+	noDefault := []ProviderConfig{{Name: "only-one"}}
+	if got := DefaultModel(noDefault); got != "only-one" {
+		t.Errorf("expected first entry, got %q", got)
+	}
+	if got := DefaultModel(nil); got != "" {
+		t.Errorf("expected empty for no providers, got %q", got)
+	}
+}
+
+func TestModelNames(t *testing.T) {
+	got := ModelNames([]ProviderConfig{{Name: "b"}, {Name: "a"}, {Name: ""}})
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("expected sorted non-empty names [a b], got %v", got)
+	}
+}

@@ -4,17 +4,25 @@
 
 > **想让你的 AI agent 帮你搭？** 把 [docs/INSTALL.md](https://github.com/vibe-coding-labs/AtomCode2Api/blob/main/docs/INSTALL.md) 的完整链接发给它，AI 会读取文档并根据你的系统环境自动选择 Docker / 源码编译 / 下载二进制三种方式之一来完成安装。
 
-## 能用哪些模型？全都是免费的
+## 能用哪些模型？
 
-| 模型 | 提供商 | 上下文 | 免费? |
-|------|--------|--------|:-----:|
-| **deepseek-v4-flash** | AtomGit | 1,000,000 | ✅ 免费 |
-| **Qwen/Qwen3-VL-8B-Instruct** | AtomGit | 64,000 | ✅ 免费 |
-| deepseek-chat | DeepSeek | 128,000 | 需 Pro |
-| deepseek-reasoner | DeepSeek | 128,000 | 需 Pro |
-| glm-5.2 | Zhipu AI | 128,000 | 需 Pro |
+模型列表由你的 CodingPlan 决定，**不要写死**。用下面的命令看当前账号实际能用哪些：
 
-免费模型由你的 CodingPlan Lite 直接覆盖，**不用额外花钱**。付费模型需要升级 Pro 套餐。
+```bash
+curl -s http://localhost:45678/v1/models | python -m json.tool
+```
+
+实测一个 CodingPlan Lite（体验版）账号，当前暴露的是：
+
+| 模型 | 上下文 | 视觉 | effort 等级 |
+|------|--------|:----:|-------------|
+| **AtomGit-glm5.3-flash** | 512,000 | ✅ | low, high |
+| **AtomGit-qwen3.8-27b**（默认） | 262,144 | ✅ | low, medium, xhigh |
+
+> ⚠️ 早期版本把 `deepseek-v4-flash` 写死成默认模型，但它**已不在 CodingPlan 目录里**。
+> 更麻烦的是：daemon 收到未知模型名时**不报错，而是静默回退到默认模型**，
+> 所以你以为在用 DeepSeek，实际跑的是另一个模型。
+> 现在代理对未知模型返回 404 并列出可用模型，不再静默降级。
 
 ## 这东西是干嘛的
 
@@ -91,7 +99,7 @@ docker run -d --name atomcode-2api \
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:45678
 export ANTHROPIC_API_KEY=sk-atmc-xxxxx
-export ANTHROPIC_MODEL=deepseek-v4-flash
+export ANTHROPIC_MODEL=<你的模型名>
 claude
 ```
 
@@ -102,7 +110,7 @@ claude
 ```bash
 export OPENAI_BASE_URL=http://localhost:45678/v1
 export OPENAI_API_KEY=sk-atmc-xxxxx
-export OPENAI_MODEL=deepseek-v4-flash
+export OPENAI_MODEL=<你的模型名>
 codex exec "你的问题"
 ```
 
@@ -111,7 +119,7 @@ codex exec "你的问题"
 在 Cursor Settings → Models 里填：
 - API Base URL: `http://localhost:45678/v1`
 - API Key: 从管理面板复制
-- Model: `deepseek-v4-flash`
+- Model: `<你的模型名>`
 
 ## 工具调用（Tool Calling）
 
