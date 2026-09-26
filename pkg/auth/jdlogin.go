@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -94,29 +95,45 @@ func QRPollStatus(sessionID string) (string, *QRSession, error) {
 	}
 }
 
-// LoadFromSystem loads AtomCode daemon credentials from the local system.
-// Reads ~/.atomcode/auth.toml which stores the OAuth access token and user info
-// from AtomCode's login flow.
-func LoadFromSystem() (*Credentials, error) {
+// AtomcodeHome resolves the AtomCode config directory.
+//
+// The daemon honours the ATOMCODE_HOME environment variable and falls back to
+// ~/.atomcode. This helper mirrors that resolution so every component agrees on
+// where auth.toml, config.toml and daemon-<port>.json live. Previously this file
+// hard-coded ~/.atomcode while pkg/atmc honoured ATOMCODE_HOME, so a daemon
+// started with a custom home produced a "logged in" daemon but an empty account
+// list in the proxy.
+func AtomcodeHome() (string, error) {
+	if h := strings.TrimSpace(os.Getenv("ATOMCODE_HOME")); h != "" {
+		return h, nil
+	}
 	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".atomcode"), nil
+}
+
+// LoadFromSystem loads AtomCode daemon credentials from the local system.
+// Reads auth.toml (OAuth access token + user info) written by AtomCode's login
+// flow, falling back to config.toml for the legacy api_key format.
+func LoadFromSystem() (*Credentials, error) {
+	dir, err := AtomcodeHome()
 	if err != nil {
 		return nil, err
 	}
 
-	// Primary: parse ~/.atomcode/auth.toml (TOML format with user info)
-	authFile := home + "/.atomcode/auth.toml"
-	data, err := os.ReadFile(authFile)
-	if err == nil {
-		creds := parseAuthToml(string(data))
-		if creds != nil {
+	// Primary: auth.toml (TOML format with user info)
+	authFile := filepath.Join(dir, "auth.toml")
+	if data, err := os.ReadFile(authFile); err == nil {
+		if creds := parseAuthToml(string(data)); creds != nil {
 			return creds, nil
 		}
 	}
 
-	// Fallback: try ~/.atomcode/config.toml (old format with api_key)
-	paths := []string{
-		home + "/.atomcode/config.toml",
-	}
+	// Fallback: config.toml (legacy format with api_key)
+	configFile := filepath.Join(dir, "config.toml")
+	paths := []string{configFile}
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {

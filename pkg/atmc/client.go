@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vibe-coding-labs/AtomCode2API/pkg/auth"
 )
 
 // Client is the HTTP client for the AtomCode daemon REST API.
@@ -77,16 +79,11 @@ func daemonPort(baseURL string) int {
 	return p
 }
 
-// atomcodeHome resolves ~/.atomcode, honouring ATOMCODE_HOME like the daemon does.
+// atomcodeHome resolves the AtomCode config directory, honouring ATOMCODE_HOME
+// like the daemon does. Kept as a thin alias over auth.AtomcodeHome so every
+// component resolves the same directory.
 func atomcodeHome() (string, error) {
-	if h := os.Getenv("ATOMCODE_HOME"); h != "" {
-		return h, nil
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".atomcode"), nil
+	return auth.AtomcodeHome()
 }
 
 // resolveDaemonToken looks up the daemon auth token introduced in AtomCode v5.1.0.

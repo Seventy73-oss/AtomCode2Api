@@ -13,7 +13,17 @@ type ToolCall struct {
 	Arguments string // raw JSON object
 }
 
-// toolCallPattern matches a complete <tool_call>...</tool_call> block.
+// callLinePattern matches the primary protocol form:
+//
+//	CALL tool_name {"k": "v"}
+//
+// The `CALL` keyword is optional so a model that emits a bare
+// `tool_name {"k":"v"}` line is still understood.
+var callLinePattern = regexp.MustCompile(`(?m)^[ \t]*(?:CALL[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]*)[ \t]+(\{.*\})[ \t]*$`)
+
+// toolCallPattern matches a complete <tool_call>...</tool_call> block, kept for
+// models that prefer markup and for backward compatibility with prompts issued
+// by older builds.
 // DOTALL is implied by the (?s) flag so pretty-printed JSON also matches.
 var toolCallPattern = regexp.MustCompile(`(?s)<tool_call>\s*(.*?)\s*</tool_call>`)
 
@@ -36,26 +46,29 @@ type rawCall struct {
 // HasToolCallMarker reports whether the text contains the start of a tool call
 // block. Used to decide whether to hold back streamed text.
 func HasToolCallMarker(s string) bool {
-	return strings.Contains(s, "<tool_call>") || strings.Contains(s, "<tool_use>")
+	return strings.Contains(s, "<tool_call>") || strings.Contains(s, "<tool_use>") ||
+		strings.Contains(s, "CALL ")
 }
 
-// ContainsCompleteToolCall reports whether a full block is present.
+// ContainsCompleteToolCall reports whether a full call is present.
 func ContainsCompleteToolCall(s string) bool {
-	return toolCallPattern.MatchString(s) || legacyPattern.MatchString(s)
+	return toolCallPattern.MatchString(s) || legacyPattern.MatchString(s) ||
+		callLinePattern.MatchString(s)
 }
 
 // Parse extracts tool calls from a complete assistant message.
 //
-// `valid` is the set of tool names the client actually declared; a block naming
+// `valid` is the set of tool names the client actually declared; a call naming
 // anything else is rejected (models sometimes hallucinate names, and ordinary
 // prose could otherwise trip the parser). Returns the cleaned text with all
-// tool-call blocks removed, plus the parsed calls.
+// call syntax removed, plus the parsed calls.
 func Parse(text string, valid map[string]bool) (clean string, calls []ToolCall) {
 	clean = text
 
 	// Unwrap fenced blocks first so their contents are parsed normally.
 	clean = fencedPattern.ReplaceAllString(clean, "$1")
 
+	// Markup form: <tool_call>{...}</tool_call>
 	matches := toolCallPattern.FindAllStringSubmatch(clean, -1)
 	for _, m := range matches {
 		if call, ok := parseBlock(m[1], valid); ok {
@@ -71,10 +84,28 @@ func Parse(text string, valid map[string]bool) (clean string, calls []ToolCall) 
 		}
 	}
 
-	// Strip every tool-call block (valid or not) from the visible text so the
-	// client never sees raw protocol markup.
+	// Primary line form: CALL tool_name {"k":"v"} (or bare tool_name {...}).
+	if len(calls) == 0 {
+		for _, m := range callLinePattern.FindAllStringSubmatch(clean, -1) {
+			name := strings.TrimSpace(m[1])
+			if valid != nil && !valid[name] {
+				continue
+			}
+			args := strings.TrimSpace(m[2])
+			if !json.Valid([]byte(args)) {
+				continue
+			}
+			calls = append(calls, ToolCall{Name: name, Arguments: args})
+		}
+	}
+
+	// Strip every call form from the visible text so the client never sees raw
+	// protocol syntax (valid or not).
 	clean = toolCallPattern.ReplaceAllString(clean, "")
 	clean = legacyPattern.ReplaceAllString(clean, "")
+	if len(calls) > 0 {
+		clean = callLinePattern.ReplaceAllString(clean, "")
+	}
 	clean = strings.TrimSpace(clean)
 
 	return clean, calls
@@ -150,15 +181,25 @@ func parseCallSyntax(body string, valid map[string]bool) (ToolCall, bool) {
 // SplitStreamBuffer decides how much of an accumulating stream buffer is safe
 // to emit as visible text.
 //
-// When a `<tool_call>` marker appears, everything from that marker onward is
-// withheld so the protocol block never reaches the client. `held` reports
-// whether any text is being withheld.
+// When a call marker appears, everything from that marker onward is withheld so
+// the protocol syntax never reaches the client. `held` reports whether any text
+// is being withheld.
 func SplitStreamBuffer(buf string) (emit string, held bool) {
-	idx := strings.Index(buf, "<tool_call>")
-	legacyIdx := strings.Index(buf, "<tool_use>")
-	if legacyIdx >= 0 && (idx < 0 || legacyIdx < idx) {
-		idx = legacyIdx
+	idx := -1
+	for _, marker := range []string{"<tool_call>", "<tool_use>"} {
+		if i := strings.Index(buf, marker); i >= 0 && (idx < 0 || i < idx) {
+			idx = i
+		}
 	}
+	// The line form: a "CALL " keyword at the start of a line.
+	if i := strings.Index(buf, "CALL "); i >= 0 && (idx < 0 || i < idx) {
+		// Only treat it as a marker at a line boundary, so prose mentioning
+		// "CALL " mid-sentence is not swallowed.
+		if i == 0 || buf[i-1] == '\n' {
+			idx = i
+		}
+	}
+
 	if idx < 0 {
 		// Guard against a partial marker split across chunks (e.g. "<tool_c").
 		if tail := partialMarkerTail(buf); tail > 0 {
@@ -172,7 +213,7 @@ func SplitStreamBuffer(buf string) (emit string, held bool) {
 // partialMarkerTail returns the length of a trailing fragment that could be the
 // beginning of a tool-call marker, so it is not emitted prematurely.
 func partialMarkerTail(buf string) int {
-	for _, marker := range []string{"<tool_call>", "<tool_use>"} {
+	for _, marker := range []string{"<tool_call>", "<tool_use>", "CALL "} {
 		// Check the longest suffix of buf that is a prefix of marker.
 		max := len(marker) - 1
 		if max > len(buf) {

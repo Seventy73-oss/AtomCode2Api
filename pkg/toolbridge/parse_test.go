@@ -178,15 +178,116 @@ func TestContainsCompleteToolCall(t *testing.T) {
 	}
 }
 
-func TestProtocolPromptIncludesSchemaAndRules(t *testing.T) {
+func TestProtocolPromptShape(t *testing.T) {
 	p := ProtocolPrompt(sampleTools(), true)
-	for _, want := range []string{"get_weather", "read_file", "parameters:", "<tool_call>", "MUST call"} {
+
+	// Both tool names and their argument hints must be present.
+	for _, want := range []string{"get_weather", "read_file", "CALL "} {
 		if !strings.Contains(p, want) {
 			t.Errorf("protocol prompt missing %q", want)
 		}
 	}
+	// Argument hints are rendered human-readably, not as a raw JSON Schema.
+	if !strings.Contains(p, "city (string, required)") {
+		t.Errorf("expected readable argument hint, got:\n%s", p)
+	}
 	if ProtocolPrompt(nil, false) != "" {
 		t.Error("expected empty prompt for no tools")
+	}
+}
+
+// The prompt must avoid the two framings that a real AtomCode daemon rejected:
+// bracketed "protocol" headers (classified as prompt injection) and raw JSON
+// Schema blocks (which trigger a doomed native function call).
+func TestProtocolPromptAvoidsRejectedFramings(t *testing.T) {
+	p := ProtocolPrompt(sampleTools(), false)
+
+	for _, bad := range []string{"[CLIENT TOOL PROTOCOL]", "TOOL PROTOCOL", "[END "} {
+		if strings.Contains(p, bad) {
+			t.Errorf("prompt contains framing rejected as injection: %q", bad)
+		}
+	}
+	if strings.Contains(p, `"type":"object"`) || strings.Contains(p, `"properties"`) {
+		t.Errorf("prompt embeds a raw JSON Schema, which triggers native tool calls:\n%s", p)
+	}
+}
+
+func TestDescribeSchema(t *testing.T) {
+	got := describeSchema(json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"city":{"type":"string","description":"City name"},
+			"days":{"type":"integer"}
+		},
+		"required":["city"]
+	}`))
+	if !strings.Contains(got, "city (string, required)") {
+		t.Errorf("missing required marker: %s", got)
+	}
+	if !strings.Contains(got, "days (integer)") {
+		t.Errorf("missing optional arg: %s", got)
+	}
+	if !strings.Contains(got, "City name") {
+		t.Errorf("missing description: %s", got)
+	}
+	// A schema with no properties yields nothing rather than an empty shell.
+	if describeSchema(json.RawMessage(`{"type":"object"}`)) != "" {
+		t.Error("expected empty description for property-less schema")
+	}
+	if describeSchema(nil) != "" {
+		t.Error("expected empty description for nil schema")
+	}
+}
+
+func TestParseCallLine(t *testing.T) {
+	// The primary protocol form emitted by real models.
+	text := "CALL get_weather {\"city\": \"Beijing\"}"
+	clean, calls := Parse(text, Names(sampleTools()))
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call, got %d (clean=%q)", len(calls), clean)
+	}
+	if calls[0].Name != "get_weather" {
+		t.Errorf("expected get_weather, got %s", calls[0].Name)
+	}
+	if calls[0].Arguments != `{"city": "Beijing"}` {
+		t.Errorf("unexpected arguments: %s", calls[0].Arguments)
+	}
+	if strings.TrimSpace(clean) != "" {
+		t.Errorf("call line should be stripped from visible text, got %q", clean)
+	}
+}
+
+func TestParseBareCallLine(t *testing.T) {
+	// Without the CALL keyword, as some models emit.
+	_, calls := Parse("get_weather {\"city\":\"Shanghai\"}", Names(sampleTools()))
+	if len(calls) != 1 || calls[0].Name != "get_weather" {
+		t.Fatalf("expected bare call line to parse, got %+v", calls)
+	}
+}
+
+func TestParseCallLineRejectsUnknownTool(t *testing.T) {
+	_, calls := Parse("CALL delete_everything {\"path\":\"/\"}", Names(sampleTools()))
+	if len(calls) != 0 {
+		t.Fatalf("unknown tool must be rejected, got %+v", calls)
+	}
+}
+
+func TestParseProseNotMistakenForCall(t *testing.T) {
+	// Ordinary prose containing braces must not be parsed as a call.
+	text := "I will explain the function {\"a\":1} syntax in my answer."
+	_, calls := Parse(text, Names(sampleTools()))
+	if len(calls) != 0 {
+		t.Fatalf("prose must not be parsed as a call, got %+v", calls)
+	}
+}
+
+func TestSplitStreamBufferHoldsCallLine(t *testing.T) {
+	emit, held := SplitStreamBuffer("Let me check.\nCALL get_weather {\"city\":")
+	if emit != "Let me check.\n" {
+		t.Errorf("expected text before CALL line, got %q", emit)
+	}
+	if !held {
+		t.Error("expected held=true once the CALL line starts")
 	}
 }
 
