@@ -120,11 +120,12 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleNonStreamChat(w http.ResponseWriter, r *http.Request, req *MessageRequest,
 	daemonMsg, provider, system, sessionID, convKey string) {
 
+	// The daemon v5.1.0 /chat body has no `system` field — the system prompt is
+	// already folded into daemonMsg by atmc.FormatAnthropicMessages.
 	daemonReq := &atmc.ChatRequest{
 		Message:   daemonMsg,
 		Stream:    true,
 		Provider:  provider,
-		System:    system,
 		SessionID: sessionID,
 	}
 
@@ -166,11 +167,12 @@ func (h *Handler) handleStreamChat(w http.ResponseWriter, r *http.Request, req *
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(200)
 
+	// The daemon v5.1.0 /chat body has no `system` field — the system prompt is
+	// already folded into daemonMsg by atmc.FormatAnthropicMessages.
 	daemonReq := &atmc.ChatRequest{
 		Message:   daemonMsg,
 		Stream:    true,
 		Provider:  provider,
-		System:    system,
 		SessionID: sessionID,
 	}
 

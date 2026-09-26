@@ -40,32 +40,47 @@ func NewHandler(s *store.Store, staticFS fs.FS, k *keepalive.Keeper, daemonClien
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/api/auth/status", h.handleAuthStatus)
-	mux.HandleFunc("/api/auth/setup", h.handleAuthSetup)
-	mux.HandleFunc("/api/auth/login", h.handleAuthLogin)
-	mux.HandleFunc("/api/auth/change-password", h.handleChangePassword)
+	// api guards every /api/* handler against a nil store. Previously the store
+	// could fail to open (e.g. CGO-less build of mattn/go-sqlite3) and the very
+	// first request dereferenced nil, panicking the server.
+	api := func(pattern string, fn http.HandlerFunc) {
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			if h.store == nil {
+				writeError(w, http.StatusServiceUnavailable,
+					"store unavailable: database failed to open")
+				return
+			}
+			fn(w, r)
+		})
+	}
 
-	mux.HandleFunc("/api/accounts", h.handleAccounts)
-	mux.HandleFunc("/api/accounts/", h.handleAccountAction)
-	mux.HandleFunc("/api/accounts-export", h.handleExportAccounts)
-	mux.HandleFunc("/api/accounts-import", h.handleImportAccounts)
-	mux.HandleFunc("/api/accounts/batch-import", h.handleBatchImport)
-	mux.HandleFunc("/api/accounts-auto-login", h.handleAutoLogin)
-	mux.HandleFunc("/api/accounts-clear-all", h.handleClearAllAccounts)
-	mux.HandleFunc("/api/stats", h.handleStats)
-	mux.HandleFunc("/api/settings", h.handleSettings)
-	mux.HandleFunc("/api/errors", h.handleErrors)
-	mux.HandleFunc("/api/models", h.handleModels)
-	mux.HandleFunc("/api/models/catalog", h.handleModelsCatalog)
-	mux.HandleFunc("/api/codingplan/status", h.handleCodingPlanStatus)
+	api("/api/auth/status", h.handleAuthStatus)
+	api("/api/auth/setup", h.handleAuthSetup)
+	api("/api/auth/login", h.handleAuthLogin)
+	api("/api/auth/change-password", h.handleChangePassword)
+
+	api("/api/accounts", h.handleAccounts)
+	api("/api/accounts/", h.handleAccountAction)
+	api("/api/accounts-export", h.handleExportAccounts)
+	api("/api/accounts-import", h.handleImportAccounts)
+	api("/api/accounts/batch-import", h.handleBatchImport)
+	api("/api/accounts-auto-login", h.handleAutoLogin)
+	api("/api/accounts-clear-all", h.handleClearAllAccounts)
+	api("/api/stats", h.handleStats)
+	api("/api/settings", h.handleSettings)
+	api("/api/errors", h.handleErrors)
+	api("/api/models", h.handleModels)
+	api("/api/models/catalog", h.handleModelsCatalog)
+	api("/api/codingplan/status", h.handleCodingPlanStatus)
+	api("/api/codingplan/daily", h.handleCodingPlanDaily)
 	mux.HandleFunc("/api/health", h.handleHealth)
-	mux.HandleFunc("/api/github-stars", h.handleGitHubStars)
+	api("/api/github-stars", h.handleGitHubStars)
 
-	mux.HandleFunc("/api/browser-login", h.handleBrowserLogin)
-	mux.HandleFunc("/api/oauth-callback", h.handleOAuthCallback)
-	mux.HandleFunc("/api/oauth-submit", h.handleOAuthSubmit)
-	mux.HandleFunc("/api/qr-login/init", h.handleQRLoginInit)
-	mux.HandleFunc("/api/qr-login/status", h.handleQRLoginStatus)
+	api("/api/browser-login", h.handleBrowserLogin)
+	api("/api/oauth-callback", h.handleOAuthCallback)
+	api("/api/oauth-submit", h.handleOAuthSubmit)
+	api("/api/qr-login/init", h.handleQRLoginInit)
+	api("/api/qr-login/status", h.handleQRLoginStatus)
 }
 
 const jwtSecretKey = "auth_jwt_secret"
@@ -151,7 +166,9 @@ func (h *Handler) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) issueJWT() (string, error) {
 	secret := h.store.GetSetting(jwtSecretKey)
 	if secret == "" { return "", fmt.Errorf("JWT secret not configured") }
-	return auth.GenerateToken("root", secret, defaultJWTExpiry)
+	// Issue a standard HS256 JWT so signing and verification share one
+	// implementation. Tokens minted by the legacy HMAC scheme still validate.
+	return auth.NewJWTManager(secret).GenerateToken("root", "admin")
 }
 
 func generateRandomHex(n int) string {
@@ -434,6 +451,12 @@ func (h *Handler) handleSettings(w http.ResponseWriter, r *http.Request) {
 		settings, err := h.store.GetSettings()
 		if err != nil { writeError(w, 500, err.Error()); return }
 		if settings == nil { settings = map[string]string{} }
+		// Never expose secrets over the API, even to an authenticated caller.
+		// Previously GET returned auth_jwt_secret + auth_password_hash to any
+		// unauthenticated client, which allowed forging a valid JWT.
+		for k := range sensitiveSettings {
+			delete(settings, k)
+		}
 		writeJSON(w, 200, map[string]any{"settings": settings})
 	case http.MethodPut:
 		if !h.isAuthenticated(r) {
@@ -442,9 +465,8 @@ func (h *Handler) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		var raw map[string]json.RawMessage
 		if !readJSONBody(w, r, &raw) { return }
-		blocked := map[string]bool{"auth_jwt_secret": true, "auth_password_hash": true}
 		for k := range raw {
-			if blocked[k] {
+			if sensitiveSettings[k] {
 				delete(raw, k)
 			}
 		}
@@ -599,86 +621,149 @@ func (h *Handler) handleCodingPlanStatus(w http.ResponseWriter, r *http.Request)
 	if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
 	if r.Method != http.MethodGet { writeError(w, 405, "method not allowed"); return }
 
-	// Static defaults
-	planName := "CodingPlan Lite"
-	expiresAt := "2026-08-13"
-	remainingDays := 24
-	totalDays := 30
-	usagePercent := 0.0
-	resetsAt := "17:45"
+	// Model catalogue split by CodingPlan tier. Free models are covered by
+	// CodingPlan Lite; the rest need Pro.
 	freeModels := []string{"deepseek-v4-flash", "Qwen/Qwen3-VL-8B-Instruct"}
 	paidModels := []string{"deepseek-chat", "deepseek-reasoner", "glm-5.2"}
 
-	// Try to parse real data from daemon's codingplan/setup response
-	if h.daemon != nil {
-		cp, err := h.daemon.CodingPlanSetup()
-		if err == nil && cp.Success {
-			// Parse report_text for plan info and usage
-			// Format: "计划: CodingPlan Lite · 到期时间 2026-08-13（剩余 24d / 共 30d）"
-			// Format: "用量: 当前时间窗口用量约 0% · 重置于 17:45（2h 28m 后）"
-			lines := strings.Split(cp.ReportText, "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if strings.Contains(line, "计划:") {
-					if n := extractBetween(line, "计划:", "·"); n != "" {
-						planName = strings.TrimSpace(n)
-					}
-					if e := extractBetween(line, "到期时间", "（"); e != "" {
-						expiresAt = strings.TrimSpace(e)
-					}
-					if r := extractBetween(line, "剩余", "d"); r != "" {
-						fmt.Sscanf(r, "%d", &remainingDays)
-					}
-					if t := extractBetween(line, "共", "d）"); t != "" {
-						fmt.Sscanf(t, "%d", &totalDays)
-					}
-				}
-				if strings.Contains(line, "用量:") {
-					if p := extractBetween(line, "约", "%"); p != "" {
-						fmt.Sscanf(p, "%f", &usagePercent)
-					}
-					if rs := extractBetween(line, "重置于", "（"); rs != "" {
-						resetsAt = strings.TrimSpace(rs)
-					}
-				}
-			}
+	// v5.1.0: read structured entitlement + quota from
+	// GET /codingplan/usage/summary. That endpoint is side-effect free, unlike
+	// /codingplan/setup which re-claims the plan and rewrites provider config.
+	if h.daemon == nil {
+		writeError(w, 503, "daemon client not available")
+		return
+	}
+
+	summary, err := h.daemon.CodingPlanUsageSummary()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{
+			"available":    false,
+			"error":        err.Error(),
+			"free_models":  freeModels,
+			"paid_models":  paidModels,
+			"pro_required": true,
+			"note":         "无法读取 CodingPlan 状态，请确认 daemon 已登录且版本 >= 5.1.0。",
+		})
+		return
+	}
+
+	// Plan / entitlement block.
+	plan := map[string]any{
+		"name":           "CodingPlan Lite",
+		"expires_at":     "",
+		"remaining_days": 0,
+		"total_days":     0,
+		"status":         0,
+		"claimed_at":     "",
+	}
+	if summary.Plan != nil {
+		plan = map[string]any{
+			"name":           summary.Plan.Name,
+			"expires_at":     summary.Plan.ExpiresAt,
+			"remaining_days": summary.Plan.RemainingDays,
+			"total_days":     summary.Plan.TotalDays,
+			"status":         summary.Plan.Status,
+			"claimed_at":     summary.Plan.ClaimedAt,
 		}
 	}
 
+	// Quota block: prefer the primary window, fall back to the first available.
+	win := summary.PrimaryWindow
+	if win == nil && len(summary.Windows) > 0 {
+		win = &summary.Windows[0]
+	}
+
+	usage := map[string]any{
+		"metric":                 "",
+		"window_hours":           0,
+		"limit":                  nil,
+		"used":                   nil,
+		"remaining":              nil,
+		"current_window_percent": 0,
+		"remaining_percent":      100,
+		"quota_exhausted":        false,
+		"resets_at":              "",
+		"reset_label":            "每日重置",
+		"seconds_until_reset":    0,
+		"description":            "",
+	}
+	if win != nil {
+		usage = map[string]any{
+			"metric":                 win.Metric,
+			"window_hours":           win.WindowHours,
+			"limit":                  win.Limit,
+			"used":                   win.Used,
+			"remaining":              win.Remaining,
+			"current_window_percent": int(win.UsagePercent),
+			"remaining_percent":      int(win.RemainingPercent),
+			"quota_exhausted":        win.QuotaExhausted,
+			"resets_at":              strOr(win.NextResetDisplay, win.NextResetAt),
+			"reset_label":            strOr(win.ResetLabel, "每日重置"),
+			"seconds_until_reset":    win.SecondsUntilReset,
+			"description":            win.UsageDescription,
+		}
+	}
+
+	// All rolling windows, for clients that want the full picture.
+	windows := make([]map[string]any, 0, len(summary.Windows))
+	for _, w := range summary.Windows {
+		windows = append(windows, map[string]any{
+			"metric":              w.Metric,
+			"window_hours":        w.WindowHours,
+			"limit":               w.Limit,
+			"used":                w.Used,
+			"remaining":           w.Remaining,
+			"usage_percent":       w.UsagePercent,
+			"remaining_percent":   w.RemainingPercent,
+			"quota_exhausted":     w.QuotaExhausted,
+			"resets_at":           strOr(w.NextResetDisplay, w.NextResetAt),
+			"reset_label":         w.ResetLabel,
+			"seconds_until_reset": w.SecondsUntilReset,
+		})
+	}
+
+	note := "免费模型由 CodingPlan Lite 额度覆盖。付费模型需升级至 Pro 套餐。"
+	if summary.QuotaHint != "" {
+		note = summary.QuotaHint
+	}
+
 	writeJSON(w, 200, map[string]any{
-		"plan": map[string]any{
-			"name":           planName,
-			"expires_at":     expiresAt,
-			"remaining_days": remainingDays,
-			"total_days":     totalDays,
-		},
-		"usage": map[string]any{
-			"current_window_percent": int(usagePercent),
-			"resets_at":              resetsAt,
-			"reset_label":            "每日重置",
-		},
+		"available":    summary.Available,
+		"plan":         plan,
+		"usage":        usage,
+		"windows":      windows,
+		"quota_hint":   summary.QuotaHint,
 		"free_models":  freeModels,
 		"paid_models":  paidModels,
 		"pro_required": true,
-		"note":         "免费模型由 CodingPlan Lite 额度覆盖，无限量使用。付费模型需升级至 Pro 套餐。",
+		"note":         note,
 	})
 }
 
-// extractBetween returns the substring between start and end markers (exclusive).
-func extractBetween(s, start, end string) string {
-	i := strings.Index(s, start)
-	if i < 0 {
-		return ""
+// handleCodingPlanDaily proxies the 60-day account-wide usage series.
+func (h *Handler) handleCodingPlanDaily(w http.ResponseWriter, r *http.Request) {
+	setCors(w)
+	if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
+	if r.Method != http.MethodGet { writeError(w, 405, "method not allowed"); return }
+
+	if h.daemon == nil {
+		writeError(w, 503, "daemon client not available")
+		return
 	}
-	i += len(start)
-	if i >= len(s) {
-		return ""
+	daily, err := h.daemon.CodingPlanUsageDaily()
+	if err != nil {
+		writeError(w, 502, err.Error())
+		return
 	}
-	j := strings.Index(s[i:], end)
-	if j < 0 {
-		return strings.TrimSpace(s[i:])
+	writeJSON(w, 200, daily)
+}
+
+// strOr returns def when s is empty.
+func strOr(s, def string) string {
+	if s == "" {
+		return def
 	}
-	return strings.TrimSpace(s[i : i+j])
+	return s
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -975,10 +1060,10 @@ func readJSONBody(w http.ResponseWriter, r *http.Request, v any) bool {
 }
 
 func (h *Handler) isAuthenticated(r *http.Request) bool {
-	token := ""
-	if a := r.Header.Get("Authorization"); len(a) > 7 && a[:7] == "Bearer " {
-		token = a[7:]
+	if h.store == nil {
+		return false
 	}
+	token := bearerToken(r)
 	if token == "" {
 		if c, err := r.Cookie("token"); err == nil {
 			token = c.Value
@@ -987,10 +1072,28 @@ func (h *Handler) isAuthenticated(r *http.Request) bool {
 	if token == "" {
 		return false
 	}
-	// Simple token validation: check it exists (JWT validation against store secret)
-	secret := ""
-	if h.store != nil {
-		secret = h.store.GetSetting("auth_jwt_secret")
+	// Verify the JWT signature and expiry against the stored secret.
+	// Previously this only checked that both strings were non-empty, so any
+	// fabricated token was accepted.
+	secret := h.store.GetSetting("auth_jwt_secret")
+	if secret == "" {
+		return false
 	}
-	return secret != "" && token != ""
+	_, err := auth.ValidateAnyToken(token, secret)
+	return err == nil
+}
+
+// bearerToken extracts a token from the Authorization: Bearer header.
+func bearerToken(r *http.Request) string {
+	a := r.Header.Get("Authorization")
+	if len(a) > 7 && strings.EqualFold(a[:7], "Bearer ") {
+		return strings.TrimSpace(a[7:])
+	}
+	return ""
+}
+
+// sensitiveSettings lists setting keys that must never cross the API boundary.
+var sensitiveSettings = map[string]bool{
+	"auth_jwt_secret":    true,
+	"auth_password_hash": true,
 }

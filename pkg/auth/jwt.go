@@ -3,12 +3,16 @@ package auth
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -146,4 +150,53 @@ func (m *JWTManager) ValidateToken(tokenStr string) (*Claims, error) {
 		return nil, fmt.Errorf("invalid token")
 	}
 	return claims, nil
+}
+
+// ValidateLegacyToken verifies the pre-existing two-segment HMAC token produced
+// by GenerateToken (pkg/auth/jdlogin.go):
+//
+//	base64url(payload) "." base64url(HMAC-SHA256(payload, secret))
+//
+// It is retained so tokens issued before the JWT unification keep working.
+func ValidateLegacyToken(tokenStr, secret string) (*Claims, error) {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("not a legacy token")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("decode payload: %w", err)
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("decode signature: %w", err)
+	}
+	expected := hmacSHA256(string(payload), secret)
+	if !hmac.Equal(sig, expected) {
+		return nil, fmt.Errorf("signature mismatch")
+	}
+	var c struct {
+		Sub string `json:"sub"`
+		Exp int64  `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &c); err != nil {
+		return nil, fmt.Errorf("parse payload: %w", err)
+	}
+	if c.Exp > 0 && time.Now().Unix() > c.Exp {
+		return nil, fmt.Errorf("token expired")
+	}
+	return &Claims{UserID: c.Sub}, nil
+}
+
+// ValidateAnyToken accepts either a standard JWT or a legacy HMAC token.
+// This is the entry point used by the dashboard middleware so that both
+// formats validate against the same stored secret.
+func ValidateAnyToken(tokenStr, secret string) (*Claims, error) {
+	if tokenStr == "" || secret == "" {
+		return nil, fmt.Errorf("missing token or secret")
+	}
+	if c, err := NewJWTManager(secret).ValidateToken(tokenStr); err == nil {
+		return c, nil
+	}
+	return ValidateLegacyToken(tokenStr, secret)
 }

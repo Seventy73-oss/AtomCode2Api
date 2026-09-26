@@ -108,6 +108,22 @@ func runServe() error {
 	mux.HandleFunc("/", dash.ServeStatic)
 
 	handler := requestLogMiddleware(mux, s)
+
+	// Enforce authentication on the dashboard API.
+	//
+	// Previously pkg/auth.JWTMiddleware existed but was never mounted, so every
+	// /api/* endpoint was reachable without credentials — including
+	// /api/accounts-export (plaintext pt_key dump) and /api/accounts-clear-all.
+	//
+	// The JWT secret is created by /api/auth/setup, which runs after startup, so
+	// the secret is resolved lazily on each request.
+	if s != nil {
+		handler = auth.JWTMiddlewareDynamic(func() string {
+			return s.GetSetting("auth_jwt_secret")
+		}, handler)
+		log.Printf("dashboard auth: enforced on /api/* (run /setup to initialize)")
+	}
+
 	if verbose {
 		handler = loggingMiddleware(handler)
 	}

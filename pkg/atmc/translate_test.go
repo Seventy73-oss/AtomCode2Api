@@ -32,8 +32,37 @@ func TestFormatMessages(t *testing.T) {
 	if !strings.Contains(got, "Assistant: hi there") {
 		t.Errorf("expected Assistant: hi there, got: %s", got)
 	}
-	if strings.Contains(got, "system") {
-		t.Errorf("system message should be excluded: %s", got)
+	// The daemon /chat body has no `system` field, so the system prompt MUST be
+	// carried inside the message text or it is silently dropped upstream.
+	if !strings.Contains(got, "system prompt") {
+		t.Errorf("system prompt must be folded into the message, got: %s", got)
+	}
+}
+
+func TestFormatMessagesWithoutSystemPrompt(t *testing.T) {
+	msgs := []map[string]any{
+		{"role": "user", "content": "hello"},
+	}
+	got := FormatMessages(msgs, "")
+	if got != "User: hello" {
+		t.Errorf("expected 'User: hello', got: %q", got)
+	}
+}
+
+func TestFindProviderForModelMatchesNameAndModel(t *testing.T) {
+	providers := []ProviderConfig{
+		{Name: "deepseek-v4-flash", Model: "deepseek-v4-flash-20260101"},
+	}
+	// Match on the selectable id (`name`).
+	if got := FindProviderForModel(providers, "deepseek-v4-flash"); got != "deepseek-v4-flash" {
+		t.Errorf("expected name match, got %q", got)
+	}
+	// Match on the concrete upstream model name.
+	if got := FindProviderForModel(providers, "deepseek-v4-flash-20260101"); got != "deepseek-v4-flash" {
+		t.Errorf("expected model fallback match, got %q", got)
+	}
+	if got := FindProviderForModel(providers, "nonexistent"); got != "" {
+		t.Errorf("expected empty for unknown model, got %q", got)
 	}
 }
 

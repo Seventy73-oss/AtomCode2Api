@@ -23,8 +23,18 @@ func ConversationKey(messages []map[string]any, system string) string {
 }
 
 // FormatMessages formats the messages list into a single daemon message string.
+//
+// The daemon v5.1.0 `/chat` body has NO `system` field, so the system prompt is
+// folded into the message body. Without this the prompt is silently dropped by
+// the daemon (see the note in crates/atomcode-daemon/src/lib.rs `struct ChatRequest`).
 func FormatMessages(messages []map[string]any, systemPrompt string) string {
 	var parts []string
+
+	// Inline the system prompt as a leading instruction block.
+	if sp := strings.TrimSpace(systemPrompt); sp != "" {
+		parts = append(parts, "System: "+sp)
+	}
+
 	for _, m := range messages {
 		role, _ := m["role"].(string)
 		content := contentString(m["content"])
@@ -39,13 +49,30 @@ func FormatMessages(messages []map[string]any, systemPrompt string) string {
 		case "assistant":
 			label = "Assistant"
 		case "system":
-			continue
+			// Already hoisted into the leading System block by the caller;
+			// a mid-conversation system message is still surfaced here.
+			if sp := strings.TrimSpace(systemPrompt); sp != "" {
+				continue
+			}
+			label = "System"
 		default:
-			label = strings.Title(role)
+			label = titleCase(role)
 		}
 		parts = append(parts, fmt.Sprintf("%s: %s", label, content))
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+// titleCase upper-cases the first rune, replacing the deprecated strings.Title.
+func titleCase(s string) string {
+	if s == "" {
+		return s
+	}
+	r := []rune(s)
+	if r[0] >= 'a' && r[0] <= 'z' {
+		r[0] -= 32
+	}
+	return string(r)
 }
 
 // contentString extracts a string from message content.
@@ -74,8 +101,15 @@ func contentString(content any) string {
 }
 
 // FindProviderForModel searches the provider list for a matching model name.
+// v5.1.0 exposes the selectable id as `name`, with `model` as the upstream name.
 func FindProviderForModel(providers []ProviderConfig, model string) string {
 	modelLower := strings.ToLower(model)
+	for _, p := range providers {
+		if strings.ToLower(p.Name) == modelLower {
+			return p.Name
+		}
+	}
+	// Fall back to matching the concrete upstream model name.
 	for _, p := range providers {
 		if strings.ToLower(p.Model) == modelLower {
 			return p.Name
@@ -102,13 +136,18 @@ func TranslateToOpenAIChunk(ev *SSEEvent, model string, toolIdx *int) string {
 		}
 		return fmt.Sprintf(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":%s,"type":"function","function":{"name":%s,"arguments":%s}}]},"index":0}]}`,
 			jsonString(id), jsonString(ev.Name), jsonString(ev.Arguments))
-	case "tool_output":
-		return ""
-	case "tool_result":
+	case "tool_output", "tool_result", "tool_progress":
 		return ""
 	case "tokens":
 		return fmt.Sprintf(`{"choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}`,
 			ev.Prompt, ev.Completion, ev.Total)
+	case "warning", "persistence_warning":
+		// Non-fatal advisories: surface as a reasoning-style notice so clients
+		// see something instead of silently dropping the signal.
+		return fmt.Sprintf(`{"choices":[{"delta":{"reasoning_content":%s},"index":0}]}`, jsonString(ev.Message))
+	case "rate_limited":
+		return fmt.Sprintf(`{"choices":[{"delta":{"reasoning_content":%s},"index":0}]}`,
+			jsonString(fmt.Sprintf("[rate limited] reset %s", strOr(ev.ResetLabel, ev.ResetAtDisplay))))
 	case "done", "stopped":
 		return "__DONE__"
 	case "error":
@@ -152,12 +191,23 @@ func TranslateToAnthropicSSE(ev *SSEEvent, model string, state *AnthropicState) 
 		return translateAnthropicReasoning(ev, model, state)
 	case "tool_start":
 		return translateAnthropicToolStart(ev, model, state)
-	case "tool_output", "tool_result":
+	case "tool_output", "tool_result", "tool_progress":
 		return nil
 	case "tokens":
 		return []string{
 			fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":%d,"input_tokens":%d},"message":%s}`,
 				ev.Completion, ev.Prompt, jsonString(state.MessageID)),
+		}
+	case "warning", "persistence_warning":
+		return []string{
+			fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`,
+				state.ContentIndex, jsonString("\n[notice] "+ev.Message+"\n")),
+		}
+	case "rate_limited":
+		label := strOr(ev.ResetLabel, ev.ResetAtDisplay)
+		return []string{
+			fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`,
+				state.ContentIndex, jsonString("\n[rate limited] resets "+label+"\n")),
 		}
 	case "done", "stopped":
 		var lines []string
@@ -274,4 +324,12 @@ func translateAnthropicToolStart(ev *SSEEvent, model string, state *AnthropicSta
 func jsonString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// strOr returns def when s is empty.
+func strOr(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }

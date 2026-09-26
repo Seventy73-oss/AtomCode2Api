@@ -16,7 +16,10 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	// Pure-Go SQLite driver. The previous mattn/go-sqlite3 binding required CGO;
+	// built with CGO_ENABLED=0 it degraded to a stub, Open() failed, and every
+	// handler that dereferenced the resulting nil *Store panicked on first request.
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -196,9 +199,19 @@ func Open(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("create db directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+	// modernc.org/sqlite uses `_pragma=` for connection settings and a `file:`
+	// URI for path-embedded options.
+	dsn := "file:" + dbPath + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
+	}
+	// modernc's driver is safe for concurrent use, but a single writer avoids
+	// SQLITE_BUSY churn under WAL.
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
 	s := &Store{db: db, dbPath: dbPath}
