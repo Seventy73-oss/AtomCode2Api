@@ -113,6 +113,32 @@ codex exec "你的问题"
 - API Key: 从管理面板复制
 - Model: `deepseek-v4-flash`
 
+## 工具调用（Tool Calling）
+
+Claude Code / Cursor / Codex 这类客户端靠工具调用干活。但 **AtomCode daemon 会忽略请求里的 `tools` 字段**，只暴露它自己的内置工具，所以没法直接透传。
+
+AtomCode2API 在中间做了一层桥接：把客户端声明的工具以文本协议注入提示词，再把模型回复解析回标准的 `tool_calls` / `tool_use`。
+
+```
+客户端发 tools ──► 代理注入协议提示词 ──► daemon ──► 模型返回 <tool_call> 块
+                                                              │
+客户端本地执行工具 ◄── 代理解析为标准 tool_calls ◄─────────────┘
+        │
+        └── 回传结果 ──► 代理渲染为 TOOL RESULT ──► daemon 继续作答
+```
+
+已经处理的情况：
+
+- 流式输出时扣留协议标记，客户端不会看到 `<tool_call>` 原文
+- 模型编造的工具名会被丢弃，不会转发给客户端
+- 兼容 markdown 代码块包裹、`parameters`/`input` 等变体字段名、`name({...})` 调用写法
+- 未声明工具时完全不走桥接，纯文本直通，零影响
+- 多轮：`assistant.tool_calls` 与 `role: "tool"` 结果都会渲染进 daemon 请求历史
+
+`tool_choice: "none"` 关闭桥接，`"required"`/`"any"` 强制本轮必须调用工具。
+
+> 注意：桥接依赖模型遵循文本协议。协议提示词会占用一部分上下文，且模型偶尔可能不按格式输出——此时会退化成普通文本回复，不会报错。
+
 ## 代码结构
 
 ```
@@ -120,6 +146,7 @@ cmd/atomcode-2api/    命令行工具（启动、设置、登录等）
 pkg/atmc/             和 AtomCode Daemon 通信的客户端
 pkg/openai/           OpenAI 协议翻译
 pkg/anthropic/        Anthropic 协议翻译
+pkg/toolbridge/       工具调用桥接（文本协议注入 + 解析）
 pkg/store/            SQLite 数据库（存账号、设置、请求日志）
 pkg/auth/             认证相关
 pkg/dashboard/        Web 管理面板

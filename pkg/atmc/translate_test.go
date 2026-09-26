@@ -233,3 +233,48 @@ func TestJsonString(t *testing.T) {
 		}
 	}
 }
+
+func TestFormatMessagesRendersToolCalls(t *testing.T) {
+	// An assistant turn that requested a tool, followed by the client's result.
+	msgs := []map[string]any{
+		{"role": "user", "content": "weather?"},
+		{"role": "assistant", "content": "", "tool_calls": []any{
+			map[string]any{
+				"id":   "call_1",
+				"type": "function",
+				"function": map[string]any{
+					"name":      "get_weather",
+					"arguments": `{"city":"Beijing"}`,
+				},
+			},
+		}},
+		{"role": "tool", "tool_call_id": "call_1", "name": "get_weather", "content": "22C"},
+	}
+	got := FormatMessages(msgs, "")
+
+	// The tool handshake must be visible to the model, otherwise it loses the
+	// thread of what it already asked for.
+	if !strings.Contains(got, "get_weather") {
+		t.Errorf("tool call not rendered: %s", got)
+	}
+	if !strings.Contains(got, "ASSISTANT CALLED TOOL") {
+		t.Errorf("assistant tool call marker missing: %s", got)
+	}
+	if !strings.Contains(got, "TOOL RESULT") {
+		t.Errorf("tool result marker missing: %s", got)
+	}
+	if !strings.Contains(got, "22C") {
+		t.Errorf("tool output missing: %s", got)
+	}
+}
+
+func TestFormatMessagesPlainToolMessage(t *testing.T) {
+	// A tool message without tool_calls history still renders its output.
+	msgs := []map[string]any{
+		{"role": "tool", "name": "read_file", "content": "file contents"},
+	}
+	got := FormatMessages(msgs, "")
+	if !strings.Contains(got, "TOOL RESULT") || !strings.Contains(got, "file contents") {
+		t.Errorf("unexpected render: %s", got)
+	}
+}

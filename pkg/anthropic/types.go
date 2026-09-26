@@ -18,6 +18,7 @@ type MessageRequest struct {
 	TopP        *float64        `json:"top_p,omitempty"`
 	TopK        *int            `json:"top_k,omitempty"`
 	Tools       jsonField       `json:"tools,omitempty"`
+	ToolChoice  jsonField       `json:"tool_choice,omitempty"`
 	Thinking    jsonField       `json:"thinking,omitempty"`
 }
 

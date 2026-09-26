@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/vibe-coding-labs/AtomCode2API/pkg/atmc"
 	"github.com/vibe-coding-labs/AtomCode2API/pkg/store"
+	"github.com/vibe-coding-labs/AtomCode2API/pkg/toolbridge"
 )
 
 // Handler implements the Anthropic Messages API.
@@ -101,24 +103,79 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build conversation key & session tracking
+	// Client-side tools. The daemon ignores a `tools` field, so definitions are
+	// injected into the prompt as a text protocol and the reply is converted
+	// back into standard tool_use blocks (see pkg/toolbridge).
+	tools := toolbridge.ParseAnthropicTools(json.RawMessage(req.Tools))
+	required := anthropicToolChoiceRequired(req.ToolChoice)
+	if anthropicToolChoiceNone(req.ToolChoice) {
+		tools = nil
+	}
+	if proto := toolbridge.ProtocolPrompt(tools, required); proto != "" {
+		formatted = proto + "\n\n" + formatted
+	}
+
+	// Build conversation key & session tracking. The declared tool set is part
+	// of the key so a conversation that gains tools does not reuse a stale
+	// daemon session.
 	msgs := messagesToMap(req.Messages)
-	convKey := atmc.ConversationKey(msgs, systemPrompt)
+	convKey := atmc.ConversationKey(msgs, systemPrompt+anthropicToolKeySuffix(tools))
 	daemonSessionID := h.sessions.get(convKey)
 
-	log.Printf("anthropic messages: model=%s stream=%t provider=%s messages=%d system=%t sid=%s",
+	log.Printf("anthropic messages: model=%s stream=%t provider=%s messages=%d system=%t tools=%d sid=%s",
 		req.Model, req.Stream, strOr(provider, "(auto)"), len(req.Messages),
-		systemPrompt != "", strOr(daemonSessionID, "(new)"))
+		systemPrompt != "", len(tools), strOr(daemonSessionID, "(new)"))
 
 	if req.Stream {
-		h.handleStreamChat(w, r, &req, formatted, provider, systemPrompt, daemonSessionID, convKey)
+		h.handleStreamChat(w, r, &req, formatted, provider, systemPrompt, daemonSessionID, convKey, tools)
 	} else {
-		h.handleNonStreamChat(w, r, &req, formatted, provider, systemPrompt, daemonSessionID, convKey)
+		h.handleNonStreamChat(w, r, &req, formatted, provider, systemPrompt, daemonSessionID, convKey, tools)
 	}
 }
 
+// anthropicToolKeySuffix folds the declared tool names into the conversation key.
+func anthropicToolKeySuffix(tools []toolbridge.Tool) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Name)
+	}
+	sort.Strings(names)
+	return "|tools:" + strings.Join(names, ",")
+}
+
+// anthropicToolChoiceNone reports whether the client disabled tool use.
+func anthropicToolChoiceNone(raw jsonField) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var obj struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &obj) == nil {
+		return obj.Type == "none"
+	}
+	return false
+}
+
+// anthropicToolChoiceRequired reports tool_choice {type:"any"} / {type:"tool"}.
+func anthropicToolChoiceRequired(raw jsonField) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var obj struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &obj) == nil {
+		return obj.Type == "any" || obj.Type == "tool"
+	}
+	return false
+}
+
 func (h *Handler) handleNonStreamChat(w http.ResponseWriter, r *http.Request, req *MessageRequest,
-	daemonMsg, provider, system, sessionID, convKey string) {
+	daemonMsg, provider, system, sessionID, convKey string, tools []toolbridge.Tool) {
 
 	// The daemon v5.1.0 /chat body has no `system` field — the system prompt is
 	// already folded into daemonMsg by atmc.FormatAnthropicMessages.
@@ -149,11 +206,77 @@ func (h *Handler) handleNonStreamChat(w http.ResponseWriter, r *http.Request, re
 	}
 
 	resp := translateToAnthropicResponse(events, req.Model)
+
+	// Convert the text protocol back into real tool_use blocks.
+	if len(tools) > 0 {
+		clean, calls := toolbridge.Parse(extractResponseText(resp), toolbridge.Names(tools))
+		if len(calls) > 0 {
+			setResponseText(resp, clean)
+			appendToolUseBlocks(resp, calls)
+		} else {
+			setResponseText(resp, clean)
+		}
+	}
+
 	writeJSON(w, 200, resp)
 }
 
+// extractResponseText concatenates the text blocks of a non-streaming response.
+func extractResponseText(resp map[string]any) string {
+	blocks, _ := resp["content"].([]any)
+	var b strings.Builder
+	for _, raw := range blocks {
+		if blk, ok := raw.(map[string]any); ok && blk["type"] == "text" {
+			if t, ok := blk["text"].(string); ok {
+				b.WriteString(t)
+			}
+		}
+	}
+	return b.String()
+}
+
+// setResponseText replaces the text content of a non-streaming response while
+// preserving any non-text blocks (thinking, tool_use).
+func setResponseText(resp map[string]any, text string) {
+	blocks, _ := resp["content"].([]any)
+	out := make([]any, 0, len(blocks)+1)
+	if strings.TrimSpace(text) != "" {
+		out = append(out, map[string]any{"type": "text", "text": text})
+	}
+	for _, raw := range blocks {
+		if blk, ok := raw.(map[string]any); ok && blk["type"] == "text" {
+			continue
+		}
+		out = append(out, raw)
+	}
+	resp["content"] = out
+}
+
+// appendToolUseBlocks adds tool_use content blocks and sets stop_reason.
+func appendToolUseBlocks(resp map[string]any, calls []toolbridge.ToolCall) {
+	blocks, _ := resp["content"].([]any)
+	for i, c := range calls {
+		id := c.ID
+		if id == "" {
+			id = fmt.Sprintf("toolu_%s_%d", c.Name, i)
+		}
+		var input any = map[string]any{}
+		if err := json.Unmarshal([]byte(c.Arguments), &input); err != nil {
+			input = map[string]any{}
+		}
+		blocks = append(blocks, map[string]any{
+			"type":  "tool_use",
+			"id":    id,
+			"name":  c.Name,
+			"input": input,
+		})
+	}
+	resp["content"] = blocks
+	resp["stop_reason"] = "tool_use"
+}
+
 func (h *Handler) handleStreamChat(w http.ResponseWriter, r *http.Request, req *MessageRequest,
-	daemonMsg, provider, system, sessionID, convKey string) {
+	daemonMsg, provider, system, sessionID, convKey string, tools []toolbridge.Tool) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -187,13 +310,77 @@ func (h *Handler) handleStreamChat(w http.ResponseWriter, r *http.Request, req *
 	var lastSessionID string
 	hasSentStop := false
 
+	// Bridge state: assistant text is buffered so a `<tool_call>` protocol block
+	// can be withheld and emitted as proper tool_use content blocks instead.
+	bridging := len(tools) > 0
+	validNames := toolbridge.Names(tools)
+	var bridgeBuf strings.Builder
+	emittedToolUse := false
+
+	send := func(line string) {
+		if strings.Contains(line, `"type":"message_stop"`) {
+			hasSentStop = true
+		}
+		fmt.Fprintf(w, "data: %s\n\n", line)
+		flusher.Flush()
+	}
+
+	// emitToolUse opens a tool_use block and streams the parsed calls into it.
+	emitToolUse := func(calls []toolbridge.ToolCall) {
+		if len(calls) == 0 {
+			return
+		}
+		if !state.HasSentStart {
+			state.HasSentStart = true
+			send(fmt.Sprintf(`{"type":"message_start","message":{"id":%s,"type":"message","role":"assistant","content":[],"model":%s,"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}},"model":%s}`,
+				jsonStr(state.MessageID), jsonStr(req.Model), jsonStr(req.Model)))
+		}
+		for _, c := range calls {
+			if state.CurrentBlock != "" {
+				send(fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, state.ContentIndex))
+				state.ContentIndex++
+			}
+			state.CurrentBlock = "tool_use"
+			id := c.ID
+			if id == "" {
+				id = fmt.Sprintf("toolu_%s_%d", c.Name, state.ContentIndex)
+			}
+			send(fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":%s,"name":%s,"input":{}}}`,
+				state.ContentIndex, jsonStr(id), jsonStr(c.Name)))
+			send(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":%s}}`,
+				state.ContentIndex, jsonStr(c.Arguments)))
+			emittedToolUse = true
+		}
+	}
+
 	for ev := range ch {
 		if ev.Type == "done" {
 			lastSessionID = ev.SessionID
-			if !hasSentStop {
+			if bridging && bridgeBuf.Len() > 0 {
+				buf := bridgeBuf.String()
+				emit, _ := toolbridge.SplitStreamBuffer(buf)
+				if emit != "" {
+					for _, line := range atmc.TranslateToAnthropicSSE(&atmc.SSEEvent{Type: "text", Content: emit}, req.Model, state) {
+						send(line)
+					}
+				}
+				_, calls := toolbridge.Parse(buf, validNames)
+				emitToolUse(calls)
+				bridgeBuf.Reset()
+			}
+			if emittedToolUse {
+				// Anthropic signals a tool call with stop_reason "tool_use".
+				if state.CurrentBlock != "" {
+					send(fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, state.ContentIndex))
+					state.CurrentBlock = ""
+				}
+				send(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{}}`)
+				send(`{"type":"message_stop"}`)
+				hasSentStop = true
+			} else if !hasSentStop {
 				lines := atmc.TranslateToAnthropicSSE(&ev, req.Model, state)
 				for _, line := range lines {
-					fmt.Fprintf(w, "data: %s\n\n", line)
+					send(line)
 				}
 				hasSentStop = true
 			}
@@ -201,13 +388,45 @@ func (h *Handler) handleStreamChat(w http.ResponseWriter, r *http.Request, req *
 			break
 		}
 
+		// Buffer assistant text while bridging.
+		if bridging && ev.Type == "text" {
+			bridgeBuf.WriteString(ev.Content)
+			buf := bridgeBuf.String()
+			if toolbridge.ContainsCompleteToolCall(buf) {
+				emit, _ := toolbridge.SplitStreamBuffer(buf)
+				if emit != "" {
+					for _, line := range atmc.TranslateToAnthropicSSE(&atmc.SSEEvent{Type: "text", Content: emit}, req.Model, state) {
+						send(line)
+					}
+				}
+				_, calls := toolbridge.Parse(buf, validNames)
+				emitToolUse(calls)
+				bridgeBuf.Reset()
+			} else if emit, _ := toolbridge.SplitStreamBuffer(buf); emit != "" {
+				for _, line := range atmc.TranslateToAnthropicSSE(&atmc.SSEEvent{Type: "text", Content: emit}, req.Model, state) {
+					send(line)
+				}
+				rest := buf[len(emit):]
+				bridgeBuf.Reset()
+				bridgeBuf.WriteString(rest)
+			}
+			continue
+		}
+
+		// While bridging, the daemon's `tokens` event would emit a stop_reason
+		// of "end_turn" via the generic translator. That contradicts the
+		// "tool_use" we emit at the end, and Anthropic clients honour the last
+		// message_delta — so suppress the intermediate stop_reason and forward
+		// only the usage numbers.
+		if bridging && ev.Type == "tokens" {
+			send(fmt.Sprintf(`{"type":"message_delta","delta":{},"usage":{"output_tokens":%d,"input_tokens":%d}}`,
+				ev.Completion, ev.Prompt))
+			continue
+		}
+
 		lines := atmc.TranslateToAnthropicSSE(&ev, req.Model, state)
 		for _, line := range lines {
-			if strings.Contains(line, `"type":"message_stop"`) {
-				hasSentStop = true
-			}
-			fmt.Fprintf(w, "data: %s\n\n", line)
-			flusher.Flush()
+			send(line)
 		}
 	}
 
@@ -219,6 +438,12 @@ func (h *Handler) handleStreamChat(w http.ResponseWriter, r *http.Request, req *
 	if lastSessionID != "" && lastSessionID != sessionID {
 		h.sessions.set(convKey, lastSessionID)
 	}
+}
+
+// jsonStr marshals a string into a JSON literal for hand-built SSE payloads.
+func jsonStr(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 // ─── Translation helpers ────────────────────────────────────────────────────

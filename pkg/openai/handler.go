@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/vibe-coding-labs/AtomCode2API/pkg/atmc"
 	"github.com/vibe-coding-labs/AtomCode2API/pkg/store"
+	"github.com/vibe-coding-labs/AtomCode2API/pkg/toolbridge"
 )
 
 // Server implements the OpenAI-compatible HTTP API.
@@ -170,26 +173,70 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Client-side tools. The daemon ignores a `tools` field, so the definitions
+	// are injected into the prompt as a text protocol and the model's reply is
+	// converted back into standard `tool_calls` (see pkg/toolbridge).
+	tools := toolbridge.ParseOpenAITools(req.Tools)
+	required := toolChoiceRequired(req.ToolChoice)
+	if toolbridge.ToolChoiceNone(req.ToolChoice) {
+		tools = nil
+	}
+
 	// Build daemon message
 	daemonMessage := atmc.FormatMessages(remaining, systemPrompt)
+	if proto := toolbridge.ProtocolPrompt(tools, required); proto != "" {
+		daemonMessage = proto + "\n\n" + daemonMessage
+	}
 
-	// Session tracking
-	convKey := atmc.ConversationKey(remaining, systemPrompt)
+	// Session tracking. Include the tool set in the key so that a conversation
+	// that gains or loses tools does not reuse a stale daemon session.
+	convKey := atmc.ConversationKey(remaining, systemPrompt+toolKeySuffix(tools))
 	daemonSessionID := s.sessions.Get(convKey)
 
-	log.Printf("openai chat: model=%s stream=%t provider=%s messages=%d system=%t sid=%s",
+	log.Printf("openai chat: model=%s stream=%t provider=%s messages=%d system=%t tools=%d sid=%s",
 		req.Model, req.Stream, strOr(provider, "(auto)"), len(remaining),
-		systemPrompt != "", strOr(daemonSessionID, "(new)"))
+		systemPrompt != "", len(tools), strOr(daemonSessionID, "(new)"))
 
 	if req.Stream {
-		s.handleStreamChat(w, r, &req, daemonMessage, provider, systemPrompt, daemonSessionID, convKey)
+		s.handleStreamChat(w, r, &req, daemonMessage, provider, systemPrompt, daemonSessionID, convKey, tools)
 	} else {
-		s.handleNonStreamChat(w, r, &req, daemonMessage, provider, systemPrompt, daemonSessionID, convKey)
+		s.handleNonStreamChat(w, r, &req, daemonMessage, provider, systemPrompt, daemonSessionID, convKey, tools)
 	}
 }
 
+// toolKeySuffix folds the declared tool names into the conversation key.
+func toolKeySuffix(tools []toolbridge.Tool) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Name)
+	}
+	sort.Strings(names)
+	return "|tools:" + strings.Join(names, ",")
+}
+
+// toolChoiceRequired reports whether the client demands a tool call this turn.
+func toolChoiceRequired(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s == "required" || s == "any"
+	}
+	var obj struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &obj) == nil {
+		return obj.Type == "any"
+	}
+	return false
+}
+
 func (s *Server) handleNonStreamChat(w http.ResponseWriter, r *http.Request, req *ChatRequest,
-	daemonMsg, provider, system, sessionID, convKey string) {
+	daemonMsg, provider, system, sessionID, convKey string, tools []toolbridge.Tool) {
 
 	// The daemon v5.1.0 /chat body has no `system` field — `system` is already
 	// folded into daemonMsg by atmc.FormatMessages.
@@ -222,11 +269,45 @@ func (s *Server) handleNonStreamChat(w http.ResponseWriter, r *http.Request, req
 	}
 
 	resp := TranslateToOpenAIResponse(events, req.Model)
+
+	// Convert the text protocol back into real tool_calls.
+	if len(tools) > 0 {
+		text := resp.Choices[0].Message.Content
+		clean, calls := toolbridge.Parse(text, toolbridge.Names(tools))
+		resp.Choices[0].Message.Content = clean
+		if len(calls) > 0 {
+			resp.Choices[0].Message.ToolCalls = toOpenAIToolCalls(calls)
+			resp.Choices[0].FinishReason = strPtr("tool_calls")
+		}
+	}
+
 	writeJSON(w, 200, resp)
 }
 
+// toOpenAIToolCalls converts parsed bridge calls into the OpenAI wire shape.
+func toOpenAIToolCalls(calls []toolbridge.ToolCall) []ToolCall {
+	out := make([]ToolCall, 0, len(calls))
+	for i, c := range calls {
+		id := c.ID
+		if id == "" {
+			id = fmt.Sprintf("call_%s_%d", c.Name, i)
+		}
+		idx := i
+		out = append(out, ToolCall{
+			Index: &idx,
+			ID:    id,
+			Type:  "function",
+			Function: ToolCallFunction{
+				Name:      c.Name,
+				Arguments: c.Arguments,
+			},
+		})
+	}
+	return out
+}
+
 func (s *Server) handleStreamChat(w http.ResponseWriter, r *http.Request, req *ChatRequest,
-	daemonMsg, provider, system, sessionID, convKey string) {
+	daemonMsg, provider, system, sessionID, convKey string, tools []toolbridge.Tool) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -260,12 +341,84 @@ func (s *Server) handleStreamChat(w http.ResponseWriter, r *http.Request, req *C
 	hasToolUse := false
 	var lastSessionID string
 
+	// Bridge state: text is buffered so a `<tool_call>` protocol block can be
+	// withheld from the client and converted into real `tool_calls` instead.
+	var bridgeBuf strings.Builder
+	bridging := len(tools) > 0
+	validNames := toolbridge.Names(tools)
+	var emittedToolCalls bool
+
+	emitText := func(text string) {
+		if text == "" {
+			return
+		}
+		delta := fmt.Sprintf(`{"choices":[{"delta":{"content":%s},"index":0}]}`, jsonString(text))
+		if full := atmc.BuildOpenAIFullChunk(delta, req.Model); full != "" {
+			fmt.Fprintf(w, "data: %s\n\n", full)
+			flusher.Flush()
+		}
+	}
+
+	// flushBridge parses the accumulated buffer and emits any tool calls.
+	// Returns true when at least one call was emitted.
+	flushBridge := func(final bool) bool {
+		if !bridging || bridgeBuf.Len() == 0 {
+			return false
+		}
+		buf := bridgeBuf.String()
+		emit, held := toolbridge.SplitStreamBuffer(buf)
+		if emit != "" {
+			emitText(emit)
+			// Keep only the withheld portion for the next round.
+			bridgeBuf.Reset()
+			if held {
+				bridgeBuf.WriteString(buf[len(emit):])
+			}
+			buf = bridgeBuf.String()
+		}
+		if !final && !toolbridge.ContainsCompleteToolCall(buf) {
+			return false
+		}
+		_, calls := toolbridge.Parse(buf, validNames)
+		if len(calls) == 0 {
+			return false
+		}
+		bridgeBuf.Reset()
+		for i, c := range calls {
+			id := c.ID
+			if id == "" {
+				id = fmt.Sprintf("call_%s_%d", c.Name, i)
+			}
+			delta := fmt.Sprintf(`{"choices":[{"delta":{"tool_calls":[{"index":%d,"id":%s,"type":"function","function":{"name":%s,"arguments":%s}}]},"index":0}]}`,
+				i, jsonString(id), jsonString(c.Name), jsonString(c.Arguments))
+			if full := atmc.BuildOpenAIFullChunk(delta, req.Model); full != "" {
+				fmt.Fprintf(w, "data: %s\n\n", full)
+				flusher.Flush()
+			}
+		}
+		return true
+	}
+
 	for ev := range ch {
 		if ev.Type == "done" {
 			lastSessionID = ev.SessionID
+			if bridging {
+				// Final flush: whatever is buffered is the model's last word.
+				if flushBridge(true) {
+					emittedToolCalls = true
+				} else if tail := bridgeBuf.String(); tail != "" {
+					_, calls := toolbridge.Parse(tail, validNames)
+					if len(calls) > 0 {
+						emittedToolCalls = true
+					} else {
+						emitText(tail)
+					}
+					bridgeBuf.Reset()
+				}
+			}
 			// Send appropriate finish_reason chunk before [DONE]
 			finishReason := "stop"
-			if hasToolUse {
+			if hasToolUse || emittedToolCalls {
 				finishReason = "tool_calls"
 			}
 			finishChunk := fmt.Sprintf(`{"id":"chatcmpl-atomcode","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"delta":{},"finish_reason":"%s","index":0}]}`, time.Now().Unix(), req.Model, finishReason)
@@ -279,6 +432,37 @@ func (s *Server) handleStreamChat(w http.ResponseWriter, r *http.Request, req *C
 		if ev.Type == "tool_start" {
 			hasToolUse = true
 		}
+
+		// Buffer assistant text while bridging so protocol blocks are hidden.
+		if bridging && ev.Type == "text" {
+			bridgeBuf.WriteString(ev.Content)
+			if toolbridge.ContainsCompleteToolCall(bridgeBuf.String()) {
+				if flushBridge(false) {
+					emittedToolCalls = true
+				}
+			} else {
+				// Emit the safe prefix, retaining any partial marker.
+				if emit, _ := toolbridge.SplitStreamBuffer(bridgeBuf.String()); emit != "" {
+					emitText(emit)
+					rest := bridgeBuf.String()[len(emit):]
+					bridgeBuf.Reset()
+					bridgeBuf.WriteString(rest)
+				}
+			}
+			continue
+		}
+		if bridging && (ev.Type == "reasoning") {
+			// Reasoning stays visible; it never contains the protocol block.
+			delta := atmc.TranslateToOpenAIChunk(&ev, req.Model, &toolIdx)
+			if delta != "" && delta != "__DONE__" {
+				if full := atmc.BuildOpenAIFullChunk(delta, req.Model); full != "" {
+					fmt.Fprintf(w, "data: %s\n\n", full)
+					flusher.Flush()
+				}
+			}
+			continue
+		}
+
 		delta := atmc.TranslateToOpenAIChunk(&ev, req.Model, &toolIdx)
 		if delta == "" {
 			continue
@@ -358,6 +542,12 @@ func (st *SessionTracker) cleanup() {
 }
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
+
+// jsonString marshals a string into a JSON literal for hand-built SSE payloads.
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
 
 func strOr(s, def string) string {
 	if s == "" {

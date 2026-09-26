@@ -27,6 +27,10 @@ func ConversationKey(messages []map[string]any, system string) string {
 // The daemon v5.1.0 `/chat` body has NO `system` field, so the system prompt is
 // folded into the message body. Without this the prompt is silently dropped by
 // the daemon (see the note in crates/atomcode-daemon/src/lib.rs `struct ChatRequest`).
+//
+// Assistant messages carrying `tool_calls` and `tool` role messages carrying
+// execution results are rendered as explicit text blocks, so the model can see
+// the tool handshake that happened on the client side.
 func FormatMessages(messages []map[string]any, systemPrompt string) string {
 	var parts []string
 
@@ -37,6 +41,43 @@ func FormatMessages(messages []map[string]any, systemPrompt string) string {
 
 	for _, m := range messages {
 		role, _ := m["role"].(string)
+
+		// Assistant turn that requested tool calls.
+		if role == "assistant" {
+			text := contentString(m["content"])
+			calls := renderToolCalls(m["tool_calls"])
+			switch {
+			case text != "" && calls != "":
+				parts = append(parts, fmt.Sprintf("Assistant: %s\n%s", text, calls))
+			case calls != "":
+				parts = append(parts, "Assistant: "+calls)
+			case text != "":
+				parts = append(parts, "Assistant: "+text)
+			}
+			continue
+		}
+
+		// Tool execution result being fed back to the model.
+		if role == "tool" {
+			content := contentString(m["content"])
+			name, _ := m["name"].(string)
+			id, _ := m["tool_call_id"].(string)
+			if content == "" && name == "" {
+				continue
+			}
+			var b strings.Builder
+			b.WriteString("User: [TOOL RESULT]")
+			if name != "" {
+				b.WriteString("\ntool: " + name)
+			}
+			if id != "" {
+				b.WriteString("\ncall_id: " + id)
+			}
+			b.WriteString("\noutput:\n" + content + "\n[END TOOL RESULT]")
+			parts = append(parts, b.String())
+			continue
+		}
+
 		content := contentString(m["content"])
 		if content == "" {
 			continue
@@ -44,10 +85,8 @@ func FormatMessages(messages []map[string]any, systemPrompt string) string {
 
 		label := "User"
 		switch role {
-		case "user", "tool":
+		case "user":
 			label = "User"
-		case "assistant":
-			label = "Assistant"
 		case "system":
 			// Already hoisted into the leading System block by the caller;
 			// a mid-conversation system message is still surfaced here.
@@ -61,6 +100,45 @@ func FormatMessages(messages []map[string]any, systemPrompt string) string {
 		parts = append(parts, fmt.Sprintf("%s: %s", label, content))
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+// renderToolCalls turns an OpenAI-style `tool_calls` array into a readable
+// text block for the daemon.
+func renderToolCalls(raw any) string {
+	list, ok := raw.([]any)
+	if !ok || len(list) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, item := range list {
+		call, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := ""
+		args := ""
+		if fn, ok := call["function"].(map[string]any); ok {
+			name, _ = fn["name"].(string)
+			args, _ = fn["arguments"].(string)
+		}
+		if name == "" {
+			name, _ = call["name"].(string)
+		}
+		if args == "" {
+			args, _ = call["arguments"].(string)
+		}
+		if name == "" {
+			continue
+		}
+		if args == "" {
+			args = "{}"
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(fmt.Sprintf("[ASSISTANT CALLED TOOL] %s(%s)", name, args))
+	}
+	return b.String()
 }
 
 // titleCase upper-cases the first rune, replacing the deprecated strings.Title.
